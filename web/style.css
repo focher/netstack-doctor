@@ -42,8 +42,7 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 14px; }
 .logo {
-  width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center;
-  background: linear-gradient(145deg, var(--accent), #5e5ce6); color: #fff; font-size: 22px;
+  width: 42px; height: 42px; border-radius: 11px; display: block;
 }
 h1 { font-size: 18px; margin: 0; letter-spacing: -.2px; }
 .subtitle { margin: 2px 0 0; color: var(--muted); font-size: 12px; }

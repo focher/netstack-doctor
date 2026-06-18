@@ -1,0 +1,26 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgB" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a84ff"/>
+      <stop offset="1" stop-color="#5e5ce6"/>
+    </linearGradient>
+  </defs>
+  <rect x="36" y="36" width="440" height="440" rx="100" fill="url(#bgB)"/>
+  <!-- network nodes / topology -->
+  <g stroke="#ffffff" stroke-width="11" stroke-linecap="round" opacity="0.85">
+    <line x1="256" y1="150" x2="150" y2="256"/>
+    <line x1="256" y1="150" x2="362" y2="256"/>
+    <line x1="150" y1="256" x2="256" y2="362"/>
+    <line x1="362" y1="256" x2="256" y2="362"/>
+    <line x1="150" y1="256" x2="362" y2="256"/>
+  </g>
+  <g fill="#ffffff">
+    <circle cx="256" cy="150" r="30"/>
+    <circle cx="150" cy="256" r="30"/>
+    <circle cx="362" cy="256" r="30"/>
+  </g>
+  <!-- central health node with check -->
+  <circle cx="256" cy="362" r="40" fill="#34c759"/>
+  <path d="M238 362 L251 375 L276 348" fill="none" stroke="#ffffff"
+        stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -15,13 +15,15 @@ if [[ "${1:-}" == "package" ]]; then
   echo "Packaging release archives..."
   cp README.md dist/
   cp scripts/gatekeeper-allow.command dist/
+  cp assets/NetStackDoctor.icns dist/
+  cp assets/NetStackDoctor.ico dist/
   chmod +x dist/gatekeeper-allow.command
   ( cd dist
-    # macOS (arm64 only) — bundle the Gatekeeper-allow helper alongside the binary.
-    tar -czf netstack-doctor-macos-arm64.tar.gz netstack-doctor-macos-arm64 gatekeeper-allow.command README.md
-    # Windows
-    zip -q netstack-doctor-windows-amd64.zip netstack-doctor.exe README.md
-    zip -q netstack-doctor-windows-arm64.zip netstack-doctor-arm64.exe README.md
+    # macOS (arm64 only) — bundle the Gatekeeper-allow helper + .icns alongside the binary.
+    tar -czf netstack-doctor-macos-arm64.tar.gz netstack-doctor-macos-arm64 gatekeeper-allow.command NetStackDoctor.icns README.md
+    # Windows (icon already embedded in the .exe via rsrc_windows_*.syso); include .ico too.
+    zip -q netstack-doctor-windows-amd64.zip netstack-doctor.exe NetStackDoctor.ico README.md
+    zip -q netstack-doctor-windows-arm64.zip netstack-doctor-arm64.exe NetStackDoctor.ico README.md
     shasum -a 256 *.zip *.tar.gz > SHA256SUMS.txt
   )
 fi

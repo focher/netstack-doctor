@@ -1,0 +1,21 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgC" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1d2b53"/>
+      <stop offset="1" stop-color="#0a84ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="36" y="36" width="440" height="440" rx="100" fill="url(#bgC)"/>
+  <!-- signal-bars rising (layers as ascending strength) -->
+  <g fill="#ffffff">
+    <rect x="132" y="300" width="44" height="80"  rx="14" opacity="0.5"/>
+    <rect x="196" y="262" width="44" height="118" rx="14" opacity="0.62"/>
+    <rect x="260" y="216" width="44" height="164" rx="14" opacity="0.74"/>
+    <rect x="324" y="160" width="44" height="220" rx="14" opacity="0.88"/>
+  </g>
+  <!-- pulse / EKG sweep across the top -->
+  <path d="M108 188 H176 L196 146 L222 232 L248 170 L268 188 H404"
+        fill="none" stroke="#34c759" stroke-width="14"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="404" cy="188" r="13" fill="#34c759"/>
+</svg>
