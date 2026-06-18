@@ -65,14 +65,16 @@ Just double-click (or run) the binary for your platform:
 # macOS (Apple Silicon)
 ./netstack-doctor-macos-arm64
 
-# macOS (Intel)
-./netstack-doctor-macos-amd64
-
 # Windows
 netstack-doctor.exe
 ```
 
 Override the listen address with `NSD_ADDR` (default `127.0.0.1:8696`).
+
+> **macOS Gatekeeper:** the binary is unsigned. The macOS archive ships a
+> `gatekeeper-allow.command` helper — double-click it (or run it) to clear the
+> quarantine attribute and launch the app. It runs `xattr -d com.apple.quarantine`
+> on the bundled binary for you.
 
 > The probes shell out to the OS-provided `ping`/`traceroute`/`arp`/`route` tools, which
 > are part of the operating system — not bundled third-party dependencies.
@@ -83,7 +85,8 @@ Requires Go 1.21+ (for `embed`).
 
 ```
 go build -o netstack-doctor .            # current platform
-./build.sh                               # all macOS + Windows targets into ./dist
+./build.sh                               # macOS arm64 + Windows targets into ./dist
+./build.sh package                       # also produce release archives + checksums
 ```
 
 The `web/` directory is embedded at compile time via `//go:embed`, which is why the
