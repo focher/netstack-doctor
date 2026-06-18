@@ -99,6 +99,12 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 
 	prompt := buildAnalysisPrompt(req.Config, req.Layers)
 
+	// Ollama's default context window (num_ctx) is only ~2048 tokens, which
+	// silently truncates the full verbose diagnostics and makes the model
+	// analyze only a fraction of the logs. Size num_ctx to fit the entire
+	// prompt + system prompt + room for the response.
+	numCtx := contextWindowFor(llmSystemPrompt + prompt)
+
 	payload := map[string]any{
 		"model":  req.Model,
 		"stream": false,
@@ -106,7 +112,10 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 			{"role": "system", "content": llmSystemPrompt},
 			{"role": "user", "content": prompt},
 		},
-		"options": map[string]any{"temperature": 0.2},
+		"options": map[string]any{
+			"temperature": 0.2,
+			"num_ctx":     numCtx,
+		},
 	}
 	buf, _ := json.Marshal(payload)
 
@@ -138,7 +147,32 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 		"model":      req.Model,
 		"analysis":   strings.TrimSpace(out.Message.Content),
 		"durationMs": out.TotalDuration / 1e6,
+		"numCtx":     numCtx,
 	})
+}
+
+// contextWindowFor estimates the tokens needed for a prompt (~4 chars/token),
+// adds headroom for the model's reply, and rounds up to a sane num_ctx value.
+// Capped at 32768 so we don't request absurd context on tiny models (Ollama
+// will further clamp to the model's own trained maximum).
+func contextWindowFor(prompt string) int {
+	const (
+		charsPerToken  = 4
+		replyHeadroom  = 2048
+		minCtx         = 4096
+		maxCtx         = 32768
+		roundTo        = 2048
+	)
+	needed := len(prompt)/charsPerToken + replyHeadroom
+	// round up to the next multiple of roundTo
+	needed = ((needed + roundTo - 1) / roundTo) * roundTo
+	if needed < minCtx {
+		needed = minCtx
+	}
+	if needed > maxCtx {
+		needed = maxCtx
+	}
+	return needed
 }
 
 const llmSystemPrompt = `You are a senior network engineer reviewing automated OSI-layer diagnostics. ` +

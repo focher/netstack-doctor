@@ -222,7 +222,7 @@ async function analyze() {
       $("aipanel-body").innerHTML = `<p class="llmstatus err">Analysis failed: ${escapeHtml(data.error || "unknown error")}</p>`;
       return;
     }
-    $("aipanel-meta").textContent = `${data.model}${data.durationMs ? " · " + (data.durationMs / 1000).toFixed(1) + "s" : ""}`;
+    $("aipanel-meta").textContent = `${data.model}${data.durationMs ? " · " + (data.durationMs / 1000).toFixed(1) + "s" : ""}${data.numCtx ? " · " + data.numCtx.toLocaleString() + " tok ctx" : ""}`;
     $("aipanel-body").innerHTML = renderMarkdown(data.analysis);
   } catch (e) {
     $("aipanel-body").innerHTML = `<p class="llmstatus err">Request failed: ${escapeHtml(String(e))}</p>`;
