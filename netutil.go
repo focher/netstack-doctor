@@ -65,7 +65,10 @@ func localAddrs() (v4 []string, v6 []string) {
 			}
 			if ip.To4() != nil {
 				v4 = append(v4, ip.String())
-			} else if ip.To16() != nil {
+			} else if ip.To16() != nil && isGlobalUnicastV6(ip) {
+				// Only count internet-routable IPv6 (2000::/3). ULA (fc00::/7)
+				// and other non-routable ranges are excluded so IPv6 probes are
+				// skipped rather than failing on hosts without real IPv6 transit.
 				v6 = append(v6, ip.String())
 			}
 		}
@@ -76,6 +79,15 @@ func localAddrs() (v4 []string, v6 []string) {
 func hasGlobalIPv6() bool {
 	_, v6 := localAddrs()
 	return len(v6) > 0
+}
+
+// isGlobalUnicastV6 reports whether ip is in the internet-routable 2000::/3 block.
+func isGlobalUnicastV6(ip net.IP) bool {
+	ip16 := ip.To16()
+	if ip16 == nil || ip.To4() != nil {
+		return false
+	}
+	return ip16[0]&0xe0 == 0x20
 }
 
 // ---- Default gateway (Layer 3) ----
@@ -172,9 +184,14 @@ func ping(target string, ipv6 bool, count int) PingResult {
 		args = []string{fam, "-n", fmt.Sprintf("%d", count), "-w", "1500", target}
 	case "darwin":
 		if ipv6 {
+			// macOS ping6's -t is a valueless flag (NOT a timeout like IPv4 ping),
+			// so passing "-t 5" makes it treat "5" as a hostname. Omit it and rely
+			// on the context timeout in runCmd to bound the call.
 			bin = "ping6"
+			args = []string{"-c", fmt.Sprintf("%d", count), target}
+		} else {
+			args = []string{"-c", fmt.Sprintf("%d", count), "-t", "5", target}
 		}
-		args = []string{"-c", fmt.Sprintf("%d", count), "-t", "5", target}
 	default:
 		fam := "-4"
 		if ipv6 {
