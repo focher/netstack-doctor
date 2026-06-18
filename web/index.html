@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NetStack Doctor</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">⌁</div>
+      <div>
+        <h1>NetStack Doctor</h1>
+        <p class="subtitle" id="hostline">OSI layer-by-layer connectivity diagnostics</p>
+      </div>
+    </div>
+    <div class="controls">
+      <label class="toggle"><input type="checkbox" id="ipv4" checked /> <span>IPv4</span></label>
+      <label class="toggle"><input type="checkbox" id="ipv6" /> <span>IPv6</span></label>
+      <input type="text" id="target" class="field" placeholder="target host (e.g. www.cloudflare.com)" />
+      <input type="text" id="dns" class="field narrow" placeholder="DNS (1.1.1.1)" />
+      <button id="run" class="primary">Run diagnostics</button>
+    </div>
+  </header>
+
+  <section class="aibar">
+    <div class="aibar-left">
+      <span class="ai-icon">✦</span>
+      <span class="ai-label">Local LLM analysis</span>
+      <select id="provider" class="field narrow">
+        <option value="ollama">Ollama</option>
+      </select>
+      <input type="text" id="llmhost" class="field narrow" placeholder="127.0.0.1:11434" value="127.0.0.1:11434" />
+      <button id="detect" class="ghost">Detect models</button>
+      <select id="model" class="field" disabled><option>— no models detected —</option></select>
+      <span id="llmstatus" class="llmstatus"></span>
+    </div>
+    <button id="analyze" class="secondary" disabled>Analyze results with AI</button>
+  </section>
+
+  <section class="summary" id="summary" hidden>
+    <div class="summary-item"><span class="dot green"></span><span id="cnt-green">0</span> healthy</div>
+    <div class="summary-item"><span class="dot yellow"></span><span id="cnt-yellow">0</span> warnings</div>
+    <div class="summary-item"><span class="dot red"></span><span id="cnt-red">0</span> failed</div>
+    <div class="summary-item meta" id="meta"></div>
+  </section>
+
+  <section id="aipanel" class="aipanel" hidden>
+    <div class="aipanel-head">
+      <span class="ai-icon">✦</span>
+      <h3 id="aipanel-title">AI analysis</h3>
+      <span id="aipanel-meta" class="muted"></span>
+      <button id="aipanel-close" class="iconbtn">✕</button>
+    </div>
+    <div id="aipanel-body" class="aipanel-body"></div>
+  </section>
+
+  <main id="grid" class="grid">
+    <div class="empty" id="empty">
+      <p>Press <strong>Run diagnostics</strong> to test all seven OSI layers.</p>
+      <p class="muted">Physical · Data Link · Network · Transport · Session · Presentation · Application</p>
+    </div>
+  </main>
+
+  <div class="modal-backdrop" id="modal" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="modal-title">Test detail</h3>
+        <button id="modal-close" class="iconbtn">✕</button>
+      </div>
+      <div class="modal-sub" id="modal-sub"></div>
+      <pre class="logbox" id="modal-logs"></pre>
+    </div>
+  </div>
+
+  <footer class="foot"><span id="platform"></span> · NetStack Doctor</footer>
+  <script src="app.js"></script>
+</body>
+</html>

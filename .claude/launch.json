@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "netstack", "runtimeExecutable": "./netstack-doctor", "runtimeArgs": [], "port": 8696 }
+  ]
+}
