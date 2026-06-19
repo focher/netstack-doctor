@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26.x" }
+      # WebView2 runtime ships with Windows 10/11; the loader is vendored by webview_go.
+      - name: Build standalone GUI app (amd64)
+        env: { CGO_ENABLED: "1" }
+        run: |
+          go build -ldflags "-s -w -H windowsgui" -o "NetStack Doctor.exe" .
+      - name: Package
+        run: |
+          Compress-Archive -Path "NetStack Doctor.exe","README.md" -DestinationPath "netstack-doctor-windows-amd64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-amd64
+          path: netstack-doctor-windows-amd64.zip
+
+  macos:
+    runs-on: macos-14   # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26.x" }
+      - name: Build standalone .app bundle
+        run: ./build.sh package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/*.app.tar.gz
+
+  release:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            windows-amd64/*
+            macos-arm64/*

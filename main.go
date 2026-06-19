@@ -3,13 +3,11 @@ package main
 import (
 	"embed"
 	"encoding/json"
-	"fmt"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"runtime"
 	"time"
 )
@@ -26,7 +24,10 @@ type RunConfig struct {
 }
 
 func main() {
-	addr := "127.0.0.1:8696"
+	// Bind the local API server. Default to an OS-assigned ephemeral port on
+	// loopback so the standalone window has no fixed-port conflicts; NSD_ADDR
+	// can pin it (useful for headless/dev use).
+	addr := "127.0.0.1:0"
 	if v := os.Getenv("NSD_ADDR"); v != "" {
 		addr = v
 	}
@@ -42,19 +43,30 @@ func main() {
 	mux.HandleFunc("/api/run", handleRun)
 	mux.HandleFunc("/api/llm/models", handleLLMModels)
 	mux.HandleFunc("/api/llm/analyze", handleLLMAnalyze)
+	mux.HandleFunc("/api/quit", handleQuit)
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("Could not bind %s: %v", addr, err)
 	}
 
-	url := "http://" + addr + "/"
-	fmt.Println("NetStack Doctor running at", url)
-	fmt.Println("Close this window (or press Ctrl+C) to quit.")
-	go openBrowser(url)
-
+	url := "http://" + ln.Addr().String() + "/"
 	srv := &http.Server{Handler: mux}
-	log.Fatal(srv.Serve(ln))
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	// runFrontend blocks: in the default (GUI) build it opens a native window
+	// and returns when the window is closed; the headless build blocks forever.
+	runFrontend(url)
+}
+
+// handleQuit lets the UI request a clean shutdown of the app.
+func handleQuit(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+	go func() { requestQuit() }()
 }
 
 func handleInfo(w http.ResponseWriter, r *http.Request) {
@@ -124,16 +136,3 @@ func osLabel() string {
 	}
 }
 
-func openBrowser(url string) {
-	time.Sleep(400 * time.Millisecond)
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	default:
-		cmd = exec.Command("xdg-open", url)
-	}
-	_ = cmd.Start()
-}

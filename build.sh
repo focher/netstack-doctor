@@ -1,31 +1,40 @@
 #!/usr/bin/env bash
-# Build single self-contained binaries for macOS (Apple Silicon) and Windows,
-# then package release archives. macOS Intel is intentionally not built.
+# Build NetStack Doctor — a standalone, native-window desktop app (no browser).
+#
+# The GUI uses a native webview (WKWebView on macOS, WebView2 on Windows) via
+# cgo, so each platform's GUI binary must be built ON that platform (cgo cannot
+# cross-compile the native webview). macOS is built here; Windows is built by
+# the GitHub Actions workflow (.github/workflows/release.yml) on a Windows runner.
+#
+# Usage:
+#   ./build.sh                 macOS .app bundle (default)
+#   ./build.sh package         macOS .app + tar.gz + checksums for release
+#   ./build.sh headless        portable server-only binary (no GUI, any OS via cross-compile)
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p dist
-LDFLAGS="-s -w"  # strip symbols for a smaller binary
+VERSION="1.2.0"
 
-echo "macOS  arm64..."; GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/netstack-doctor-macos-arm64 .
-echo "Windows amd64..."; GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/netstack-doctor.exe .
-echo "Windows arm64..."; GOOS=windows GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/netstack-doctor-arm64.exe .
-
-# Package only when explicitly requested: ./build.sh package
-if [[ "${1:-}" == "package" ]]; then
-  echo "Packaging release archives..."
-  cp README.md dist/
-  cp scripts/gatekeeper-allow.command dist/
-  cp assets/NetStackDoctor.icns dist/
-  cp assets/NetStackDoctor.ico dist/
-  chmod +x dist/gatekeeper-allow.command
-  ( cd dist
-    # macOS (arm64 only) — bundle the Gatekeeper-allow helper + .icns alongside the binary.
-    tar -czf netstack-doctor-macos-arm64.tar.gz netstack-doctor-macos-arm64 gatekeeper-allow.command NetStackDoctor.icns README.md
-    # Windows (icon already embedded in the .exe via rsrc_windows_*.syso); include .ico too.
-    zip -q netstack-doctor-windows-amd64.zip netstack-doctor.exe NetStackDoctor.ico README.md
-    zip -q netstack-doctor-windows-arm64.zip netstack-doctor-arm64.exe NetStackDoctor.ico README.md
-    shasum -a 256 *.zip *.tar.gz > SHA256SUMS.txt
-  )
-fi
+case "${1:-app}" in
+  headless)
+    echo "Building headless (server-only) binaries — no cgo, cross-compiles freely..."
+    CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -tags headless -ldflags "-s -w" -o dist/netstack-doctor-headless-macos-arm64 .
+    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags headless -ldflags "-s -w" -o dist/netstack-doctor-headless-windows-amd64.exe .
+    CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -tags headless -ldflags "-s -w" -o dist/netstack-doctor-headless-linux-amd64 .
+    ;;
+  package)
+    bash scripts/make-macos-app.sh "$VERSION"
+    cp scripts/gatekeeper-allow.command dist/
+    cp README.md dist/
+    chmod +x dist/gatekeeper-allow.command
+    ( cd dist
+      tar -czf "netstack-doctor-macos-arm64.app.tar.gz" "NetStack Doctor.app" gatekeeper-allow.command README.md
+      shasum -a 256 *.app.tar.gz > SHA256SUMS.txt 2>/dev/null || true
+    )
+    ;;
+  *)
+    bash scripts/make-macos-app.sh "$VERSION"
+    ;;
+esac
 
 echo "Done:"; ls -lh dist/

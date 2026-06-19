@@ -1,19 +1,22 @@
 # NetStack Doctor
 
 A cross-platform (macOS + Windows) network diagnostic tool that tests **every layer of
-the OSI model** to troubleshoot connection and behavior issues. It ships as a **single
-self-contained binary** — the entire UI is embedded in the executable, so there is
-nothing to install and no runtime dependencies.
+the OSI model** to troubleshoot connection and behavior issues. It is a **fully
+standalone desktop app** — the UI renders in its own native window (WKWebView on macOS,
+WebView2 on Windows), with everything embedded in the bundle. **No browser, no separate
+server, no runtime to install.**
 
 ![card UI](docs/screenshot.png)
 
 ## What it does
 
-When launched, the binary starts a tiny local web server (bound to `127.0.0.1` only)
-and opens your default browser to a modern, card-based dashboard. Press **Run
-diagnostics** and it probes all seven OSI layers, multiple ways each, and reports every
-result as **green / yellow / red**. Click any test to open the full raw log of exactly
-what was executed (ping transcripts, TLS certificate details, traceroute hops, etc.).
+Launch the app and it opens a modern, card-based dashboard in its **own native window**.
+Internally it serves the UI over a loopback-only (`127.0.0.1`) connection on an
+OS-assigned ephemeral port that only its own window talks to — nothing is exposed and no
+web browser is involved. Press **Run diagnostics** and it probes all seven OSI layers,
+multiple ways each, reporting every result as **green / yellow / red**. Click any test to
+open the full raw log of exactly what was executed (ping transcripts, TLS certificate
+details, traceroute hops, etc.).
 
 Every probe captures **maximally verbose output**: each log includes wall-clock +
 elapsed timestamps for every step, the exact command/syscall invoked, the complete raw
@@ -59,35 +62,35 @@ Fluent accent + squarer corners on Windows, and it respects system light/dark mo
 
 ## Running
 
-Just double-click (or run) the binary for your platform:
+- **macOS (Apple Silicon):** double-click **NetStack Doctor.app**. The window opens
+  directly — no browser. WKWebView is part of macOS, so there's nothing to install.
+- **Windows (x64):** double-click **NetStack Doctor.exe**. It renders in a native
+  WebView2 window (WebView2 ships with Windows 10/11).
 
-```
-# macOS (Apple Silicon)
-./netstack-doctor-macos-arm64
-
-# Windows
-netstack-doctor.exe
-```
-
-Override the listen address with `NSD_ADDR` (default `127.0.0.1:8696`).
-
-> **macOS Gatekeeper:** the binary is unsigned. The macOS archive ships a
-> `gatekeeper-allow.command` helper — double-click it (or run it) to clear the
-> quarantine attribute and launch the app. It runs `xattr -d com.apple.quarantine`
-> on the bundled binary for you.
+> **macOS Gatekeeper:** the app is ad-hoc signed (not notarized). The macOS archive ships
+> a `gatekeeper-allow.command` helper — double-click it to clear the quarantine attribute
+> and launch the app (`xattr -dr com.apple.quarantine "NetStack Doctor.app"`).
 
 > The probes shell out to the OS-provided `ping`/`traceroute`/`arp`/`route` tools, which
 > are part of the operating system — not bundled third-party dependencies.
 
+### Headless mode
+
+A server-only build (no native window, opens a loopback port you point any browser at) is
+available for development, CI, or headless servers — `./build.sh headless`. Set `NSD_ADDR`
+to pin the port (e.g. `NSD_ADDR=127.0.0.1:8696`).
+
 ## Building from source
 
-Requires Go 1.21+ (for `embed`).
+Requires Go 1.21+ and a C toolchain (the native webview uses cgo).
 
 ```
-go build -o netstack-doctor .            # current platform
-./build.sh                               # macOS arm64 + Windows targets into ./dist
-./build.sh package                       # also produce release archives + checksums
+./build.sh            # build the macOS .app bundle (Apple Silicon)
+./build.sh package    # .app + tar.gz + checksums for release
+./build.sh headless   # server-only binaries (no cgo, cross-compiles to mac/win/linux)
 ```
 
-The `web/` directory is embedded at compile time via `//go:embed`, which is why the
-output is a single binary with no external assets.
+Because the native webview is cgo, each platform's GUI build must run **on that platform**
+— macOS locally, Windows via the bundled GitHub Actions workflow
+(`.github/workflows/release.yml`) on a Windows runner. The `web/` UI is embedded at
+compile time via `//go:embed`, so the app has no external assets.
