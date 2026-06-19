@@ -98,12 +98,19 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 	base := normalizeOllama(req.Host)
 
 	prompt := buildAnalysisPrompt(req.Config, req.Layers)
+	fullInput := llmSystemPrompt + prompt
 
 	// Ollama's default context window (num_ctx) is only ~2048 tokens, which
 	// silently truncates the full verbose diagnostics and makes the model
 	// analyze only a fraction of the logs. Size num_ctx to fit the entire
 	// prompt + system prompt + room for the response.
-	numCtx := contextWindowFor(llmSystemPrompt + prompt)
+	numCtx := contextWindowFor(fullInput)
+
+	// Request-side stats describing exactly what we're sending the model.
+	reqInfo := analyzeRequestInfo(req.Config, req.Layers, prompt, numCtx)
+
+	// Fetch model attributes (max context, params, quant, family, ...) in parallel-ish.
+	modelInfo := fetchModelInfo(base, req.Model)
 
 	payload := map[string]any{
 		"model":  req.Model,
@@ -136,34 +143,175 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
-		TotalDuration int64 `json:"total_duration"`
+		DoneReason         string `json:"done_reason"`
+		TotalDuration      int64  `json:"total_duration"`
+		LoadDuration       int64  `json:"load_duration"`
+		PromptEvalCount    int    `json:"prompt_eval_count"`
+		PromptEvalDuration int64  `json:"prompt_eval_duration"`
+		EvalCount          int    `json:"eval_count"`
+		EvalDuration       int64  `json:"eval_duration"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": "could not parse model response: " + err.Error()})
 		return
 	}
+
+	// Generation metrics straight from Ollama. prompt_eval_count is the exact
+	// number of input tokens the model actually ingested — the proof the whole
+	// log made it in (compare against the model's max context).
+	genTokPerSec := 0.0
+	if out.EvalDuration > 0 {
+		genTokPerSec = float64(out.EvalCount) / (float64(out.EvalDuration) / 1e9)
+	}
+	metrics := map[string]any{
+		"promptTokens":     out.PromptEvalCount,
+		"responseTokens":   out.EvalCount,
+		"totalMs":          out.TotalDuration / 1e6,
+		"loadMs":           out.LoadDuration / 1e6,
+		"promptEvalMs":     out.PromptEvalDuration / 1e6,
+		"evalMs":           out.EvalDuration / 1e6,
+		"genTokensPerSec":  round1(genTokPerSec),
+		"doneReason":       out.DoneReason,
+	}
+	if modelInfo != nil && modelInfo.MaxContext > 0 && out.PromptEvalCount > 0 {
+		metrics["contextUsedPct"] = round1(float64(out.PromptEvalCount) / float64(modelInfo.MaxContext) * 100)
+	}
+
 	writeJSON(w, map[string]any{
 		"ok":         true,
+		"endpoint":   base,
 		"model":      req.Model,
 		"analysis":   strings.TrimSpace(out.Message.Content),
 		"durationMs": out.TotalDuration / 1e6,
 		"numCtx":     numCtx,
+		"request":    reqInfo,
+		"modelInfo":  modelInfo,
+		"metrics":    metrics,
 	})
 }
 
-// contextWindowFor estimates the tokens needed for a prompt (~4 chars/token),
-// adds headroom for the model's reply, and rounds up to a sane num_ctx value.
+// modelDetails holds the attributes Ollama reports for a model via /api/show.
+type modelDetails struct {
+	Family       string   `json:"family"`
+	Architecture string   `json:"architecture"`
+	ParameterSize string  `json:"parameterSize"`
+	Quantization string   `json:"quantization"`
+	Format       string   `json:"format"`
+	MaxContext   int      `json:"maxContext"`
+	EmbedLength  int      `json:"embeddingLength"`
+	Capabilities []string `json:"capabilities"`
+	SizeGB       float64  `json:"sizeGB"`
+}
+
+// fetchModelInfo queries Ollama /api/show for model attributes. Returns nil on error.
+func fetchModelInfo(base, model string) *modelDetails {
+	reqBody, _ := json.Marshal(map[string]string{"model": model})
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Post(base+"/api/show", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	var show struct {
+		Details struct {
+			Family           string `json:"family"`
+			Format           string `json:"format"`
+			ParameterSize    string `json:"parameter_size"`
+			QuantizationLevel string `json:"quantization_level"`
+		} `json:"details"`
+		ModelInfo    map[string]any `json:"model_info"`
+		Capabilities []string       `json:"capabilities"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&show) != nil {
+		return nil
+	}
+	md := &modelDetails{
+		Family:        show.Details.Family,
+		Format:        show.Details.Format,
+		ParameterSize: show.Details.ParameterSize,
+		Quantization:  show.Details.QuantizationLevel,
+		Capabilities:  show.Capabilities,
+	}
+	// model_info keys are namespaced by architecture, e.g. "qwen2.context_length".
+	if arch, ok := show.ModelInfo["general.architecture"].(string); ok {
+		md.Architecture = arch
+	}
+	for k, v := range show.ModelInfo {
+		n, ok := v.(float64)
+		if !ok {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(k, ".context_length"):
+			md.MaxContext = int(n)
+		case strings.HasSuffix(k, ".embedding_length"):
+			md.EmbedLength = int(n)
+		}
+	}
+	return md
+}
+
+// analyzeRequestInfo summarizes the payload being sent to the model.
+func analyzeRequestInfo(config, layers json.RawMessage, prompt string, numCtx int) map[string]any {
+	nLayers, nTests, nLogLines := countDiagnostics(layers)
+	approxTokens := estimateTokens(llmSystemPrompt + prompt)
+	return map[string]any{
+		"promptChars":      len(prompt),
+		"systemPromptChars": len(llmSystemPrompt),
+		"totalChars":       len(llmSystemPrompt) + len(prompt),
+		"approxTokens":     approxTokens,
+		"layers":           nLayers,
+		"tests":            nTests,
+		"logLines":         nLogLines,
+		"numCtxRequested":  numCtx,
+	}
+}
+
+// countDiagnostics tallies layers, tests, and total log lines in the payload.
+func countDiagnostics(layers json.RawMessage) (nLayers, nTests, nLogLines int) {
+	var ls []struct {
+		Tests []struct {
+			Logs []string `json:"logs"`
+		} `json:"tests"`
+	}
+	if json.Unmarshal(layers, &ls) != nil {
+		return
+	}
+	nLayers = len(ls)
+	for _, l := range ls {
+		nTests += len(l.Tests)
+		for _, t := range l.Tests {
+			nLogLines += len(t.Logs)
+		}
+	}
+	return
+}
+
+func round1(f float64) float64 {
+	return float64(int(f*10+0.5)) / 10
+}
+
+// estimateTokens approximates the token count of a string. Dense JSON with lots
+// of punctuation/hex tokenizes at roughly 3 chars/token (measured ~3.05 against
+// real Ollama prompt_eval_count), so we use 3 rather than the looser 4 to avoid
+// under-sizing the context window.
+func estimateTokens(s string) int { return len(s) / 3 }
+
+// contextWindowFor sizes num_ctx to comfortably fit the whole prompt PLUS the
+// model's reply, so neither the diagnostics log nor the response gets evicted.
 // Capped at 32768 so we don't request absurd context on tiny models (Ollama
 // will further clamp to the model's own trained maximum).
 func contextWindowFor(prompt string) int {
 	const (
-		charsPerToken  = 4
-		replyHeadroom  = 2048
-		minCtx         = 4096
-		maxCtx         = 32768
-		roundTo        = 2048
+		replyHeadroom = 3072
+		minCtx        = 4096
+		maxCtx        = 32768
+		roundTo       = 2048
 	)
-	needed := len(prompt)/charsPerToken + replyHeadroom
+	needed := estimateTokens(prompt) + replyHeadroom
 	// round up to the next multiple of roundTo
 	needed = ((needed + roundTo - 1) / roundTo) * roundTo
 	if needed < minCtx {

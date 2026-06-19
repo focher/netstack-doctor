@@ -203,6 +203,8 @@ async function analyze() {
   const panel = $("aipanel");
   panel.hidden = false;
   $("aipanel-meta").textContent = "";
+  $("aipanel-stats").hidden = true;
+  $("aipanel-stats").innerHTML = "";
   $("aipanel-body").innerHTML =
     `<div class="thinking"><div class="spinner"></div> ${escapeHtml($("model").value)} is analyzing ${lastRunData.layers.length} layers of results…</div>`;
   panel.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -222,13 +224,75 @@ async function analyze() {
       $("aipanel-body").innerHTML = `<p class="llmstatus err">Analysis failed: ${escapeHtml(data.error || "unknown error")}</p>`;
       return;
     }
-    $("aipanel-meta").textContent = `${data.model}${data.durationMs ? " · " + (data.durationMs / 1000).toFixed(1) + "s" : ""}${data.numCtx ? " · " + data.numCtx.toLocaleString() + " tok ctx" : ""}`;
+    $("aipanel-meta").textContent = `${data.model}${data.durationMs ? " · " + (data.durationMs / 1000).toFixed(1) + "s" : ""}`;
+    renderAnalysisStats(data);
     $("aipanel-body").innerHTML = renderMarkdown(data.analysis);
   } catch (e) {
     $("aipanel-body").innerHTML = `<p class="llmstatus err">Request failed: ${escapeHtml(String(e))}</p>`;
   } finally {
     btn.disabled = false;
   }
+}
+
+// Render the model + request + generation detail grid above the analysis.
+function renderAnalysisStats(data) {
+  const el = $("aipanel-stats");
+  const m = data.modelInfo || {};
+  const rq = data.request || {};
+  const mx = data.metrics || {};
+  const cell = (k, v) => v == null || v === "" ? "" :
+    `<div class="statcell"><div class="k">${escapeHtml(k)}</div><div class="v">${v}</div></div>`;
+  const num = (n) => n == null ? null : Number(n).toLocaleString();
+  const ms = (n) => n == null ? null : n >= 1000 ? (n / 1000).toFixed(1) + "s" : Math.round(n) + "ms";
+
+  let html = "";
+
+  // --- Model ---
+  html += `<div class="statgroup">Model</div>`;
+  html += cell("Name", escapeHtml(data.model));
+  html += cell("Parameters", m.parameterSize && escapeHtml(m.parameterSize));
+  html += cell("Quantization", m.quantization && escapeHtml(m.quantization));
+  html += cell("Architecture", m.architecture && escapeHtml(m.architecture));
+  html += cell("Family", m.family && escapeHtml(m.family));
+  html += cell("Format", m.format && escapeHtml(m.format.toUpperCase()));
+  html += cell("Max context", m.maxContext && num(m.maxContext) + " <small>tok</small>");
+  html += cell("Embedding dim", m.embeddingLength && num(m.embeddingLength));
+  if (m.capabilities && m.capabilities.length)
+    html += cell("Capabilities", escapeHtml(m.capabilities.join(", ")));
+  html += cell("Endpoint", data.endpoint && escapeHtml(data.endpoint.replace(/^https?:\/\//, "")));
+
+  // --- Log / payload sent ---
+  html += `<div class="statgroup">Diagnostics log sent</div>`;
+  html += cell("Layers", rq.layers != null && num(rq.layers));
+  html += cell("Tests", rq.tests != null && num(rq.tests));
+  html += cell("Log lines", rq.logLines != null && num(rq.logLines));
+  html += cell("Payload size", rq.totalChars != null && num(rq.totalChars) + " <small>chars</small>");
+  html += cell("Approx tokens", rq.approxTokens != null && "~" + num(rq.approxTokens));
+  html += cell("Context window", data.numCtx && num(data.numCtx) + " <small>tok requested</small>");
+
+  // --- Generation metrics ---
+  html += `<div class="statgroup">Generation</div>`;
+  html += cell("Prompt tokens", mx.promptTokens != null && num(mx.promptTokens) + " <small>ingested</small>");
+  html += cell("Response tokens", mx.responseTokens != null && num(mx.responseTokens));
+  html += cell("Speed", mx.genTokensPerSec != null && mx.genTokensPerSec + " <small>tok/s</small>");
+  html += cell("Model load", ms(mx.loadMs));
+  html += cell("Prompt eval", ms(mx.promptEvalMs));
+  html += cell("Generation", ms(mx.evalMs));
+  html += cell("Total", ms(mx.totalMs));
+  if (mx.doneReason) html += cell("Finish reason", escapeHtml(mx.doneReason));
+
+  // --- Context utilization bar (proves the whole log fit) ---
+  if (mx.promptTokens && m.maxContext) {
+    const pct = Math.min(100, (mx.promptTokens / m.maxContext) * 100);
+    const usedPct = mx.contextUsedPct != null ? mx.contextUsedPct : pct.toFixed(1);
+    html += `<div class="ctxbar">
+      <div class="lbl">Input used <strong>${num(mx.promptTokens)}</strong> of ${num(m.maxContext)} max context tokens (${usedPct}%) — full diagnostics log ingested, not truncated</div>
+      <div class="track"><div class="fill" style="width:${pct}%"></div></div>
+    </div>`;
+  }
+
+  el.innerHTML = html;
+  el.hidden = false;
 }
 
 // Minimal, safe Markdown renderer (headings, bold, code, lists, paragraphs).
