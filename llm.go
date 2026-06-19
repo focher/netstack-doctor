@@ -323,21 +323,84 @@ func contextWindowFor(prompt string) int {
 	return needed
 }
 
-const llmSystemPrompt = `You are a senior network engineer reviewing automated OSI-layer diagnostics. ` +
-	`Be concise and practical. Identify the most likely root cause of any failures or warnings, ` +
-	`explain the impact in plain terms, and give concrete next troubleshooting steps. ` +
-	`Use the layer results to reason bottom-up (a lower-layer failure often explains higher-layer ones). ` +
-	`Format your answer in short Markdown sections: Summary, Likely Issues, Recommended Actions.`
+const llmSystemPrompt = `You are a senior network engineer reviewing automated OSI-layer diagnostics.
+
+STATUS VALUES — read each test's "status" field exactly. Do not invent or infer status:
+- green = passed / healthy.
+- yellow = warning or degraded, but still functional.
+- red = FAILED. These are the real problems.
+- gray = SKIPPED / not applicable — the test did NOT run (e.g. IPv6 probes skipped because the host has no global IPv6 address). A gray test is NOT a pass and NOT a failure. Never describe a gray test as "working", "healthy", "successful", or "green". State that it was skipped and why (read its "summary"/logs for the reason). Do not recommend fixes for skipped tests beyond noting the precondition (e.g. "no IPv6 connectivity to test").
+
+LAYER NUMBERING — use the OSI layer number and name exactly as given in each layer's "layer" and "name" fields. The seven layers are fixed: 1 Physical, 2 Data Link, 3 Network, 4 Transport, 5 Session, 6 Presentation, 7 Application. Never renumber, merge, skip, or rename a layer, and never put a test under the wrong layer. If you reference a finding, cite it as "Layer N (Name)" matching the data. Do not combine two layers into one heading.
+
+REASONING:
+- Reason bottom-up: a lower-layer red often explains higher-layer reds, so identify the deepest failing layer first.
+- Base every claim on the actual status fields and logs provided — do not assume a layer passed if its data isn't green.
+- If there are no red or yellow tests, say so plainly rather than inventing issues.
+
+OUTPUT — concise Markdown with exactly these sections:
+### Summary  (2-3 sentences: overall health, note which layers were skipped and why)
+### Likely Issues  (list EVERY red and EVERY yellow test — one bullet each, do not omit or merge any, even minor ones; tag each "Layer N (Name): test name (red/yellow) — reason"; write "None" only if there are zero red and zero yellow tests)
+### Recommended Actions  (concrete next steps for the real issues; omit actions for skipped tests)`
 
 func buildAnalysisPrompt(config, layers json.RawMessage) string {
 	var sb strings.Builder
 	sb.WriteString("Here are the network diagnostic results as JSON.\n")
 	sb.WriteString("Configuration:\n")
 	sb.Write(indentJSON(config))
-	sb.WriteString("\n\nLayer results (each test has status green=ok, yellow=warning, red=failed, gray=skipped, plus a verbose log):\n")
+	sb.WriteString("\n\nLayer results follow. Each layer has a fixed \"layer\" number (1-7) and \"name\"; each test has a \"status\" (green=ok, yellow=warning, red=failed, gray=SKIPPED/not-run) and a verbose log:\n")
 	sb.Write(indentJSON(layers))
-	sb.WriteString("\n\nAnalyze these results.")
+
+	// Deterministic checklist: the app already knows exactly which tests are
+	// flagged, so spell them out. Small models reliably cover an explicit list
+	// but often miss items when asked to scan the full JSON themselves.
+	flagged, skipped := flaggedAndSkipped(layers)
+	sb.WriteString("\n\nCHECKLIST — these are the ONLY non-green tests. Your \"Likely Issues\" section must contain exactly one bullet for EACH of these (no more, no fewer):\n")
+	if len(flagged) == 0 {
+		sb.WriteString("  (none — there are no red or yellow tests; write \"None\")\n")
+	} else {
+		for _, f := range flagged {
+			sb.WriteString("  - " + f + "\n")
+		}
+	}
+	if len(skipped) > 0 {
+		sb.WriteString("Skipped (gray) tests — mention these were skipped in the Summary, but do NOT list them as issues and do NOT call them healthy:\n")
+		for _, s := range skipped {
+			sb.WriteString("  - " + s + "\n")
+		}
+	}
+
+	sb.WriteString("\nAnalyze these results. Treat gray as skipped (not a pass), keep the exact layer numbers/names, and cover every checklist item.")
 	return sb.String()
+}
+
+// flaggedAndSkipped returns human-readable "Layer N (Name): test (status) — summary"
+// lines for red/yellow tests, and a separate list for gray/skipped tests.
+func flaggedAndSkipped(layers json.RawMessage) (flagged, skipped []string) {
+	var ls []struct {
+		Layer int    `json:"layer"`
+		Name  string `json:"name"`
+		Tests []struct {
+			Name    string `json:"name"`
+			Status  string `json:"status"`
+			Summary string `json:"summary"`
+		} `json:"tests"`
+	}
+	if json.Unmarshal(layers, &ls) != nil {
+		return
+	}
+	for _, l := range ls {
+		for _, t := range l.Tests {
+			line := fmt.Sprintf("Layer %d (%s): %s (%s) — %s", l.Layer, l.Name, t.Name, t.Status, t.Summary)
+			switch t.Status {
+			case "red", "yellow":
+				flagged = append(flagged, line)
+			case "gray":
+				skipped = append(skipped, fmt.Sprintf("Layer %d (%s): %s — %s", l.Layer, l.Name, t.Name, t.Summary))
+			}
+		}
+	}
+	return
 }
 
 func indentJSON(raw json.RawMessage) []byte {
