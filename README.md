@@ -62,14 +62,19 @@ Fluent accent + squarer corners on Windows, and it respects system light/dark mo
 
 ## Running
 
-- **macOS (Apple Silicon):** double-click **NetStack Doctor.app**. The window opens
-  directly — no browser. WKWebView is part of macOS, so there's nothing to install.
-- **Windows (x64):** double-click **NetStack Doctor.exe**. It renders in a native
-  WebView2 window (WebView2 ships with Windows 10/11).
+- **macOS (Apple Silicon):** open the **`.dmg`**, then right-click
+  **“Install — Bypass Gatekeeper.command”** and choose **Open**. It copies the app to
+  Applications, clears the quarantine flag, and launches it. The window opens directly —
+  no browser (WKWebView is part of macOS).
+- **Windows (x64):** unzip and double-click **NetStack Doctor.exe**. It renders in a
+  native WebView2 window (WebView2 ships with Windows 10/11).
 
-> **macOS Gatekeeper:** the app is ad-hoc signed (not notarized). The macOS archive ships
-> a `gatekeeper-allow.command` helper — double-click it to clear the quarantine attribute
-> and launch the app (`xattr -dr com.apple.quarantine "NetStack Doctor.app"`).
+> **Why the installer step on macOS?** The app is ad-hoc signed but not notarized by
+> Apple, so Gatekeeper marks downloaded copies as “damaged/cannot be opened.” The bundled
+> installer removes the quarantine attribute
+> (`xattr -dr com.apple.quarantine "/Applications/NetStack Doctor.app"`) so it runs. You
+> can also drag the app to Applications and run that command yourself — see
+> “READ ME FIRST.txt” in the DMG.
 
 > The probes shell out to the OS-provided `ping`/`traceroute`/`arp`/`route` tools, which
 > are part of the operating system — not bundled third-party dependencies.

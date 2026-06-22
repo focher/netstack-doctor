@@ -1,0 +1,22 @@
+NetStack Doctor — macOS install
+================================
+
+This app is not notarized by Apple, so macOS Gatekeeper will block it on first
+launch ("damaged" / "cannot be opened"). That is expected for an unsigned app —
+the one-click installer below clears the flag that causes it.
+
+EASIEST — one click
+-------------------
+1. Right-click "Install — Bypass Gatekeeper.command" and choose Open.
+2. Click Open again if macOS asks.
+   It copies the app to Applications, removes the quarantine flag, and launches it.
+
+MANUAL — drag and drop
+----------------------
+1. Drag "NetStack Doctor.app" onto the Applications folder shown here.
+2. Open Terminal and run:
+      xattr -dr com.apple.quarantine "/Applications/NetStack Doctor.app"
+3. Launch NetStack Doctor from Applications.
+
+The app runs entirely on your machine. It opens its own window (no web browser)
+and tests all seven OSI network layers.

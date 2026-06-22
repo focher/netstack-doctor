@@ -8,12 +8,13 @@
 #
 # Usage:
 #   ./build.sh                 macOS .app bundle (default)
-#   ./build.sh package         macOS .app + tar.gz + checksums for release
+#   ./build.sh dmg             distributable .dmg (app + Gatekeeper-bypass installer)
+#   ./build.sh package         dmg + checksums for release
 #   ./build.sh headless        portable server-only binary (no GUI, any OS via cross-compile)
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p dist
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 case "${1:-app}" in
   headless)
@@ -22,15 +23,12 @@ case "${1:-app}" in
     CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags headless -ldflags "-s -w" -o dist/netstack-doctor-headless-windows-amd64.exe .
     CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -tags headless -ldflags "-s -w" -o dist/netstack-doctor-headless-linux-amd64 .
     ;;
+  dmg)
+    bash scripts/make-dmg.sh "$VERSION"
+    ;;
   package)
-    bash scripts/make-macos-app.sh "$VERSION"
-    cp scripts/gatekeeper-allow.command dist/
-    cp README.md dist/
-    chmod +x dist/gatekeeper-allow.command
-    ( cd dist
-      tar -czf "netstack-doctor-macos-arm64.app.tar.gz" "NetStack Doctor.app" gatekeeper-allow.command README.md
-      shasum -a 256 *.app.tar.gz > SHA256SUMS.txt 2>/dev/null || true
-    )
+    bash scripts/make-dmg.sh "$VERSION"
+    ( cd dist && shasum -a 256 *.dmg > SHA256SUMS.txt 2>/dev/null || true )
     ;;
   *)
     bash scripts/make-macos-app.sh "$VERSION"
