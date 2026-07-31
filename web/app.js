@@ -206,8 +206,12 @@ async function run() {
         if (lastLayers.length !== data.layers.length) render(data.layers);
         else lastLayers = data.layers;
         lastRunData = data;
+        lastAnalysis = null;          // the analysis belongs to the previous run
         updateSummary(data);
         updateAnalyzeButton();
+        updateExportButtons();
+        // Recorded after rendering so a slow write never delays the results.
+        recordRun(data);
       }
     });
   } catch (e) {
@@ -230,6 +234,14 @@ function escapeHtml(s) {
 // ---------- Local LLM (Ollama) ----------
 
 let lastRunData = null;
+// Markdown of the most recent analysis, so exports can include it.
+let lastAnalysis = null;
+
+function updateExportButtons() {
+  const ready = !!lastRunData;
+  $("export-md").disabled = !ready;
+  $("export-json").disabled = !ready;
+}
 
 function setLLMStatus(msg, cls) {
   const el = $("llmstatus");
@@ -364,7 +376,8 @@ async function analyze() {
         $("aipanel-meta").textContent =
           `${data.model}${data.durationMs ? " · " + (data.durationMs / 1000).toFixed(1) + "s" : ""}`;
         renderAnalysisStats(data);
-        body.innerHTML = renderMarkdown(data.analysis || text);
+        lastAnalysis = data.analysis || text;
+        body.innerHTML = renderMarkdown(lastAnalysis);
       }
     });
   } catch (e) {
@@ -469,5 +482,11 @@ $("model").addEventListener("change", updateAnalyzeButton);
 $("provider").addEventListener("change", onProviderChange);
 $("aipanel-close").addEventListener("click", () => ($("aipanel").hidden = true));
 
+$("export-md").addEventListener("click", exportMarkdown);
+$("export-json").addEventListener("click", exportJSON);
+$("history").addEventListener("change", onHistoryPick);
+$("diffpanel-close").addEventListener("click", () => ($("diffpanel").hidden = true));
+
 $("run").addEventListener("click", run);
 loadInfo();
+refreshHistoryPicker();

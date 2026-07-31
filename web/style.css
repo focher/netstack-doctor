@@ -203,3 +203,23 @@ select.field { appearance: auto; cursor: pointer; min-width: 160px; }
   background: var(--accent); opacity: .75; animation: caret-blink 1s steps(2, start) infinite;
 }
 @keyframes caret-blink { to { visibility: hidden; } }
+
+/* Export controls and history picker in the summary bar. */
+.summary-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.summary-actions .field.narrow { width: 210px; }
+
+/* Run-to-run diff. */
+.difflist { list-style: none; margin: 4px 0; padding: 0; }
+.diffrow {
+  display: flex; gap: 12px; align-items: flex-start; padding: 9px 0;
+  border-bottom: 1px solid var(--line); font-size: 13px; line-height: 1.45;
+}
+.diffrow:last-child { border-bottom: 0; }
+.diffbadge {
+  flex: 0 0 auto; min-width: 118px; font-size: 11px; font-weight: 700; padding: 3px 9px;
+  border-radius: 20px; text-align: center; color: #fff; background: var(--gray);
+}
+.diffrow.worse .diffbadge { background: var(--red); }
+.diffrow.better .diffbadge { background: var(--green); }
+.diffrow.added .diffbadge { background: var(--accent); }
+.diffrow.removed .diffbadge { background: var(--muted); }
