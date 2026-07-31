@@ -5,32 +5,53 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 )
 
+// Upper bounds on how much of a proxied Ollama response we will buffer. Guards
+// against a mistyped/hostile endpoint streaming an unbounded body into memory.
+const (
+	maxTagsBody = 1 << 20 // /api/tags, /api/show
+	maxChatBody = 8 << 20 // /api/chat
+)
+
 // normalizeOllama turns user input like "192.168.1.10", "192.168.1.10:11434",
-// or "http://host:11434" into a clean base URL.
+// "http://host:11434", or a bare IPv6 literal like "::1" into a clean base URL.
 func normalizeOllama(host string) string {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		host = "127.0.0.1"
 	}
-	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
-		host = "http://" + host
+	scheme := "http://"
+	if strings.HasPrefix(host, "https://") {
+		scheme = "https://"
 	}
-	host = strings.TrimRight(host, "/")
-	// append default Ollama port if none specified
-	rest := strings.TrimPrefix(strings.TrimPrefix(host, "http://"), "https://")
-	if !strings.Contains(rest, ":") {
-		host += ":11434"
+	host = strings.TrimPrefix(strings.TrimPrefix(host, "http://"), "https://")
+	// Base URL only: drop any path/query and trailing slashes.
+	if i := strings.IndexAny(host, "/?#"); i >= 0 {
+		host = host[:i]
 	}
-	return host
+	// Bare IPv6 literal (two-plus colons, unbracketed): bracket it so a port
+	// can be attached and the URL parses.
+	if strings.Count(host, ":") >= 2 && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	// Append the default Ollama port if none is present.
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		host = net.JoinHostPort(strings.Trim(host, "[]"), "11434")
+	}
+	return scheme + host
 }
 
 // handleLLMModels proxies Ollama's GET /api/tags so the browser avoids CORS.
 func handleLLMModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		Host string `json:"host"`
 	}
@@ -44,7 +65,7 @@ func handleLLMModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxTagsBody))
 	if resp.StatusCode != 200 {
 		writeJSON(w, map[string]any{"ok": false, "error": fmt.Sprintf("Ollama returned %s", resp.Status), "endpoint": base})
 		return
@@ -52,10 +73,10 @@ func handleLLMModels(w http.ResponseWriter, r *http.Request) {
 
 	var tags struct {
 		Models []struct {
-			Name       string `json:"name"`
-			Model      string `json:"model"`
-			Size       int64  `json:"size"`
-			Details    struct {
+			Name    string `json:"name"`
+			Model   string `json:"model"`
+			Size    int64  `json:"size"`
+			Details struct {
 				ParameterSize string `json:"parameter_size"`
 			} `json:"details"`
 		} `json:"models"`
@@ -81,6 +102,10 @@ func handleLLMModels(w http.ResponseWriter, r *http.Request) {
 
 // handleLLMAnalyze builds a diagnostic prompt and asks the local model to interpret it.
 func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		Host   string          `json:"host"`
 		Model  string          `json:"model"`
@@ -109,8 +134,12 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 	// Request-side stats describing exactly what we're sending the model.
 	reqInfo := analyzeRequestInfo(req.Config, req.Layers, prompt, numCtx)
 
-	// Fetch model attributes (max context, params, quant, family, ...) in parallel-ish.
-	modelInfo := fetchModelInfo(base, req.Model)
+	// Fetch model attributes (max context, params, quant, family, ...) in
+	// parallel with the chat request — they are only needed for the metrics
+	// block after generation completes, so don't pay for the /api/show
+	// round-trip up front.
+	infoCh := make(chan *modelDetails, 1)
+	go func() { infoCh <- fetchModelInfo(base, req.Model) }()
 
 	payload := map[string]any{
 		"model":  req.Model,
@@ -133,7 +162,7 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxChatBody))
 	if resp.StatusCode != 200 {
 		writeJSON(w, map[string]any{"ok": false, "error": fmt.Sprintf("Ollama returned %s: %s", resp.Status, string(body))})
 		return
@@ -156,6 +185,8 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	modelInfo := <-infoCh
+
 	// Generation metrics straight from Ollama. prompt_eval_count is the exact
 	// number of input tokens the model actually ingested — the proof the whole
 	// log made it in (compare against the model's max context).
@@ -164,14 +195,14 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 		genTokPerSec = float64(out.EvalCount) / (float64(out.EvalDuration) / 1e9)
 	}
 	metrics := map[string]any{
-		"promptTokens":     out.PromptEvalCount,
-		"responseTokens":   out.EvalCount,
-		"totalMs":          out.TotalDuration / 1e6,
-		"loadMs":           out.LoadDuration / 1e6,
-		"promptEvalMs":     out.PromptEvalDuration / 1e6,
-		"evalMs":           out.EvalDuration / 1e6,
-		"genTokensPerSec":  round1(genTokPerSec),
-		"doneReason":       out.DoneReason,
+		"promptTokens":    out.PromptEvalCount,
+		"responseTokens":  out.EvalCount,
+		"totalMs":         out.TotalDuration / 1e6,
+		"loadMs":          out.LoadDuration / 1e6,
+		"promptEvalMs":    out.PromptEvalDuration / 1e6,
+		"evalMs":          out.EvalDuration / 1e6,
+		"genTokensPerSec": round1(genTokPerSec),
+		"doneReason":      out.DoneReason,
 	}
 	if modelInfo != nil && modelInfo.MaxContext > 0 && out.PromptEvalCount > 0 {
 		metrics["contextUsedPct"] = round1(float64(out.PromptEvalCount) / float64(modelInfo.MaxContext) * 100)
@@ -192,15 +223,15 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 
 // modelDetails holds the attributes Ollama reports for a model via /api/show.
 type modelDetails struct {
-	Family       string   `json:"family"`
-	Architecture string   `json:"architecture"`
-	ParameterSize string  `json:"parameterSize"`
-	Quantization string   `json:"quantization"`
-	Format       string   `json:"format"`
-	MaxContext   int      `json:"maxContext"`
-	EmbedLength  int      `json:"embeddingLength"`
-	Capabilities []string `json:"capabilities"`
-	SizeGB       float64  `json:"sizeGB"`
+	Family        string   `json:"family"`
+	Architecture  string   `json:"architecture"`
+	ParameterSize string   `json:"parameterSize"`
+	Quantization  string   `json:"quantization"`
+	Format        string   `json:"format"`
+	MaxContext    int      `json:"maxContext"`
+	EmbedLength   int      `json:"embeddingLength"`
+	Capabilities  []string `json:"capabilities"`
+	SizeGB        float64  `json:"sizeGB"`
 }
 
 // fetchModelInfo queries Ollama /api/show for model attributes. Returns nil on error.
@@ -217,15 +248,15 @@ func fetchModelInfo(base, model string) *modelDetails {
 	}
 	var show struct {
 		Details struct {
-			Family           string `json:"family"`
-			Format           string `json:"format"`
-			ParameterSize    string `json:"parameter_size"`
+			Family            string `json:"family"`
+			Format            string `json:"format"`
+			ParameterSize     string `json:"parameter_size"`
 			QuantizationLevel string `json:"quantization_level"`
 		} `json:"details"`
 		ModelInfo    map[string]any `json:"model_info"`
 		Capabilities []string       `json:"capabilities"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&show) != nil {
+	if json.NewDecoder(io.LimitReader(resp.Body, maxTagsBody)).Decode(&show) != nil {
 		return nil
 	}
 	md := &modelDetails{
@@ -259,14 +290,14 @@ func analyzeRequestInfo(config, layers json.RawMessage, prompt string, numCtx in
 	nLayers, nTests, nLogLines := countDiagnostics(layers)
 	approxTokens := estimateTokens(llmSystemPrompt + prompt)
 	return map[string]any{
-		"promptChars":      len(prompt),
+		"promptChars":       len(prompt),
 		"systemPromptChars": len(llmSystemPrompt),
-		"totalChars":       len(llmSystemPrompt) + len(prompt),
-		"approxTokens":     approxTokens,
-		"layers":           nLayers,
-		"tests":            nTests,
-		"logLines":         nLogLines,
-		"numCtxRequested":  numCtx,
+		"totalChars":        len(llmSystemPrompt) + len(prompt),
+		"approxTokens":      approxTokens,
+		"layers":            nLayers,
+		"tests":             nTests,
+		"logLines":          nLogLines,
+		"numCtxRequested":   numCtx,
 	}
 }
 

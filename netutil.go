@@ -12,6 +12,16 @@ import (
 	"time"
 )
 
+// Package-level compiled patterns — these used to be compiled on every call
+// (and reHopLine on every traceroute output line), which is pure waste.
+var (
+	reWinGateway = regexp.MustCompile(`0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)`)
+	reMACAddr    = regexp.MustCompile(`([0-9a-fA-F]{1,2}[:-]){5}[0-9a-fA-F]{1,2}`)
+	rePingAvg    = regexp.MustCompile(`(?:=|Average =)\s*[\d.]+/([\d.]+)/|Average = (\d+)ms`)
+	rePingLoss   = regexp.MustCompile(`([\d.]+)% (?:packet )?loss`)
+	reHopLine    = regexp.MustCompile(`^\d+`)
+)
+
 // ---- Interface enumeration (Layer 1 / 2) ----
 
 type IfaceInfo struct {
@@ -111,8 +121,7 @@ func defaultGateway() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		re := regexp.MustCompile(`0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)`)
-		if m := re.FindStringSubmatch(out); m != nil {
+		if m := reWinGateway.FindStringSubmatch(out); m != nil {
 			return m[1], nil
 		}
 	default: // linux
@@ -151,8 +160,7 @@ func arpLookup(ip string) (string, error) {
 			return "", err
 		}
 	}
-	re := regexp.MustCompile(`([0-9a-fA-F]{1,2}[:-]){5}[0-9a-fA-F]{1,2}`)
-	if m := re.FindString(out); m != "" {
+	if m := reMACAddr.FindString(out); m != "" {
 		return strings.ToLower(strings.ReplaceAll(m, "-", ":")), nil
 	}
 	return "", fmt.Errorf("no ARP entry for %s", ip)
@@ -213,8 +221,7 @@ func parsePing(res PingResult, out string, err error) PingResult {
 		res.ExitInfo = "exit status 0"
 	}
 	// average latency
-	reAvg := regexp.MustCompile(`(?:=|Average =)\s*[\d.]+/([\d.]+)/|Average = (\d+)ms`)
-	if m := reAvg.FindStringSubmatch(out); m != nil {
+	if m := rePingAvg.FindStringSubmatch(out); m != nil {
 		for _, g := range m[1:] {
 			if g != "" {
 				fmt.Sscanf(g, "%f", &res.AvgMs)
@@ -222,8 +229,7 @@ func parsePing(res PingResult, out string, err error) PingResult {
 		}
 	}
 	// loss
-	reLoss := regexp.MustCompile(`([\d.]+)% (?:packet )?loss`)
-	if m := reLoss.FindStringSubmatch(out); m != nil {
+	if m := rePingLoss.FindStringSubmatch(out); m != nil {
 		res.Loss = m[1] + "%"
 		res.OK = m[1] != "100" && m[1] != "100.0"
 	} else if err == nil {
@@ -264,7 +270,7 @@ func traceroute(target string, ipv6 bool, maxHops int) (raw string, hops int, cm
 	sc := bufio.NewScanner(strings.NewReader(out))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
-		if regexp.MustCompile(`^\d+`).MatchString(line) {
+		if reHopLine.MatchString(line) {
 			hops++
 		}
 	}

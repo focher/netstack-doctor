@@ -102,6 +102,10 @@ func rollup(tests []TestResult) string {
 // RunAllLayers executes the 7 OSI layer suites. Layers run in parallel; each
 // layer's probes run sequentially so logs stay readable.
 func RunAllLayers(cfg RunConfig) []LayerResult {
+	// Layers 2 and 3 both need the default gateway, and resolving it spawns an
+	// external route/ip command each time — do it once here and share it.
+	cfg.gw, cfg.gwErr = defaultGateway()
+
 	type job struct {
 		idx int
 		fn  func(RunConfig) LayerResult
@@ -210,7 +214,7 @@ func layer1Physical(cfg RunConfig) LayerResult {
 func layer2DataLink(cfg RunConfig) LayerResult {
 	var tests []TestResult
 
-	gw, gwErr := defaultGateway()
+	gw, gwErr := cfg.gw, cfg.gwErr
 
 	tests = append(tests, timed("Default gateway discovery", func(l *logger) (string, string) {
 		l.step("querying OS routing table for default route (0.0.0.0/0)")
@@ -221,7 +225,7 @@ func layer2DataLink(cfg RunConfig) LayerResult {
 		}
 		l.step("default gateway resolved to %s", gw)
 		l.add("default gateway = %s", gw)
-		return Green, "Default gateway: "+gw
+		return Green, "Default gateway: " + gw
 	}))
 
 	tests = append(tests, timed("Gateway ARP / L2 reachability", func(l *logger) (string, string) {
@@ -248,7 +252,7 @@ func layer2DataLink(cfg RunConfig) LayerResult {
 		l.step("gateway L2 (MAC) address = %s", mac)
 		l.add("gateway MAC = %s", mac)
 		l.add("OUI (vendor prefix) = %s", ouiPrefix(mac))
-		return Green, "Gateway L2 address resolved: "+mac
+		return Green, "Gateway L2 address resolved: " + mac
 	}))
 
 	tests = append(tests, timed("MAC addressing present", func(l *logger) (string, string) {
@@ -300,7 +304,8 @@ func layer3Network(cfg RunConfig) LayerResult {
 	}))
 
 	// Gateway ping
-	if gw, err := defaultGateway(); err == nil {
+	if cfg.gwErr == nil {
+		gw := cfg.gw
 		tests = append(tests, timed("Ping default gateway", func(l *logger) (string, string) {
 			l.step("ICMP echo to default gateway %s (3 packets)", gw)
 			pr := ping(gw, false, 3)
@@ -334,7 +339,7 @@ func layer3Network(cfg RunConfig) LayerResult {
 			if pr.OK {
 				return Green, fmt.Sprintf("%s reachable (%.0f ms)", host, pr.AvgMs)
 			}
-			return Red, host+" unreachable (ICMP may be filtered)"
+			return Red, host + " unreachable (ICMP may be filtered)"
 		}))
 	}
 	if cfg.IPv4 {
@@ -485,9 +490,9 @@ func buildDNSQuery(name string) []byte {
 		msg = append(msg, byte(len(label)))
 		msg = append(msg, []byte(label)...)
 	}
-	msg = append(msg, 0x00)             // root
-	msg = append(msg, 0x00, 0x01)       // type A
-	msg = append(msg, 0x00, 0x01)       // class IN
+	msg = append(msg, 0x00)       // root
+	msg = append(msg, 0x00, 0x01) // type A
+	msg = append(msg, 0x00, 0x01) // class IN
 	return msg
 }
 
@@ -505,7 +510,7 @@ func layer5Session(cfg RunConfig) LayerResult {
 		l.add("session established: version=%s cipher=%s", tlsVersionName(state.Version), tls.CipherSuiteName(state.CipherSuite))
 		l.add("ALPN protocol     : %s", emptyDash(state.NegotiatedProtocol))
 		l.add("OCSP stapled      : %v", len(state.OCSPResponse) > 0)
-		return Green, "Session established with "+cfg.Target
+		return Green, "Session established with " + cfg.Target
 	}))
 
 	tests = append(tests, timed("TLS session resumption", func(l *logger) (string, string) {
@@ -609,25 +614,33 @@ func tlsHandshake(host string, v6 bool, l *logger) (tls.ConnectionState, error) 
 func layer6Presentation(cfg RunConfig) LayerResult {
 	var tests []TestResult
 
+	// One handshake serves both probes below: they hit the same endpoint with
+	// the same config, so a second full dial+handshake adds a network
+	// round-trip without producing any new information. Probes within a layer
+	// run sequentially, so sharing state here is race-free.
+	var st tls.ConnectionState
+	var hsErr error
+
 	tests = append(tests, timed("TLS version & cipher negotiation", func(l *logger) (string, string) {
-		st, err := tlsHandshake(cfg.Target, false, l)
-		if err != nil {
+		st, hsErr = tlsHandshake(cfg.Target, false, l)
+		if hsErr != nil {
 			return Red, "TLS negotiation failed"
 		}
 		l.add("version = %s", tlsVersionName(st.Version))
 		l.add("cipher  = %s", tls.CipherSuiteName(st.CipherSuite))
 		l.add("ALPN    = %s", emptyDash(st.NegotiatedProtocol))
 		if st.Version < tls.VersionTLS12 {
-			return Yellow, "Negotiated outdated TLS ("+tlsVersionName(st.Version)+")"
+			return Yellow, "Negotiated outdated TLS (" + tlsVersionName(st.Version) + ")"
 		}
 		return Green, fmt.Sprintf("%s / %s", tlsVersionName(st.Version), tls.CipherSuiteName(st.CipherSuite))
 	}))
 
 	tests = append(tests, timed("Certificate chain validation", func(l *logger) (string, string) {
-		st, err := tlsHandshake(cfg.Target, false, l)
-		if err != nil {
+		if hsErr != nil {
+			l.add("handshake failed in the negotiation probe: %v", hsErr)
 			return Red, "Could not retrieve certificate"
 		}
+		l.step("reusing TLS state from the negotiation probe (no second handshake)")
 		if len(st.PeerCertificates) == 0 {
 			return Red, "No certificate presented"
 		}
@@ -683,7 +696,7 @@ func layer6Presentation(cfg RunConfig) LayerResult {
 		if enc == "" {
 			return Yellow, "Server returned uncompressed payload"
 		}
-		return Green, "Presentation-layer encoding negotiated ("+enc+")"
+		return Green, "Presentation-layer encoding negotiated (" + enc + ")"
 	}))
 
 	return LayerResult{6, "Presentation", "TLS, certificates, encoding/compression", rollup(tests), tests}
@@ -728,7 +741,7 @@ func layer7Application(cfg RunConfig) LayerResult {
 				if err != nil {
 					l.add("lookup error: %v", err)
 				}
-				return Yellow, "No AAAA (IPv6) records for "+cfg.Target
+				return Yellow, "No AAAA (IPv6) records for " + cfg.Target
 			}
 			for _, ip := range ips {
 				l.add("AAAA %s", ip.String())
@@ -744,12 +757,12 @@ func layer7Application(cfg RunConfig) LayerResult {
 		names, err := net.DefaultResolver.LookupAddr(ctx, cfg.DNS)
 		if err != nil || len(names) == 0 {
 			l.add("ptr error/empty: %v", err)
-			return Yellow, "No PTR record for "+cfg.DNS
+			return Yellow, "No PTR record for " + cfg.DNS
 		}
 		for _, n := range names {
 			l.add("PTR %s", n)
 		}
-		return Green, "Reverse DNS resolves: "+strings.TrimSuffix(names[0], ".")
+		return Green, "Reverse DNS resolves: " + strings.TrimSuffix(names[0], ".")
 	}))
 
 	// HTTPS application request
@@ -800,7 +813,7 @@ func layer7Application(cfg RunConfig) LayerResult {
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			return Green, "HTTP/80 redirects to secure endpoint"
 		}
-		return Green, "HTTP/80 responded: "+resp.Status
+		return Green, "HTTP/80 responded: " + resp.Status
 	}))
 
 	return LayerResult{7, "Application", "DNS, HTTP/HTTPS, app protocols", rollup(tests), tests}
@@ -865,4 +878,3 @@ func tlsVersionName(v uint16) string {
 	}
 	return fmt.Sprintf("0x%04x", v)
 }
-
