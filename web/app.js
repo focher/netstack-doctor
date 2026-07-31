@@ -107,9 +107,28 @@ $("modal-close").addEventListener("click", () => ($("modal").hidden = true));
 $("modal").addEventListener("click", (e) => { if (e.target.id === "modal") $("modal").hidden = true; });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("modal").hidden = true; });
 
-async function run() {
+// Non-null only while a run is in flight. Aborting it drops the HTTP
+// connection, which cancels the request context server-side and stops the
+// probes mid-flight rather than letting every timeout play out.
+let runAbort = null;
+
+function setRunning(on) {
   const btn = $("run");
-  btn.disabled = true; btn.textContent = "Running…";
+  btn.textContent = on ? "Cancel" : "Run diagnostics";
+  btn.classList.toggle("danger", on);
+  btn.disabled = false;
+}
+
+function cancelRun() {
+  if (runAbort) runAbort.abort();
+}
+
+async function run() {
+  // While a run is in flight the primary button is the cancel control.
+  if (runAbort) { cancelRun(); return; }
+
+  runAbort = new AbortController();
+  setRunning(true);
   $("empty") && ($("empty").style.display = "none");
   skeleton();
   try {
@@ -123,16 +142,24 @@ async function run() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cfg),
+      signal: runAbort.signal,
     });
+    if (!r.ok) throw new Error((await r.text()).trim() || `HTTP ${r.status}`);
     const data = await r.json();
     lastRunData = data;
     render(data.layers);
     updateSummary(data);
     updateAnalyzeButton();
   } catch (e) {
-    grid.innerHTML = `<div class="empty"><p>Diagnostics failed: ${escapeHtml(String(e))}</p></div>`;
+    if (e && e.name === "AbortError") {
+      grid.innerHTML = `<div class="empty"><p>Run cancelled.</p>
+        <p class="muted">Press <strong>Run diagnostics</strong> to start again.</p></div>`;
+    } else {
+      grid.innerHTML = `<div class="empty"><p>Diagnostics failed: ${escapeHtml(String(e))}</p></div>`;
+    }
   } finally {
-    btn.disabled = false; btn.textContent = "Run diagnostics";
+    runAbort = null;
+    setRunning(false);
   }
 }
 

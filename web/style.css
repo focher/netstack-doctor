@@ -61,6 +61,8 @@ h1 { font-size: 18px; margin: 0; letter-spacing: -.2px; }
   border-radius: 9px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit;
 }
 .primary:disabled { opacity: .55; cursor: progress; }
+/* The run button becomes the cancel control while a run is in flight. */
+.primary.danger { background: var(--red); }
 
 .aibar {
   display: flex; align-items: center; justify-content: space-between; gap: 14px;

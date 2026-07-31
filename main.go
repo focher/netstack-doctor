@@ -186,8 +186,11 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		cfg.IPv4 = true
 	}
 
+	// r.Context() is cancelled when the client goes away — including when the
+	// UI aborts the fetch — so an abandoned run stops probing instead of
+	// grinding through every remaining timeout.
 	start := time.Now()
-	layers := RunAllLayers(cfg)
+	layers := RunAllLayers(r.Context(), cfg)
 	writeJSON(w, map[string]any{
 		"ranAt":      time.Now().Format(time.RFC3339),
 		"durationMs": time.Since(start).Milliseconds(),

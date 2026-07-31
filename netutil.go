@@ -103,10 +103,10 @@ func isGlobalUnicastV6(ip net.IP) bool {
 // ---- Default gateway (Layer 3) ----
 
 // defaultGateway returns the IPv4 default gateway address.
-func defaultGateway() (string, error) {
+func defaultGateway(ctx context.Context) (string, error) {
 	switch runtime.GOOS {
 	case "darwin":
-		out, err := runCmd(3*time.Second, "route", "-n", "get", "default")
+		out, err := runCmd(ctx, 3*time.Second, "route", "-n", "get", "default")
 		if err != nil {
 			return "", err
 		}
@@ -117,7 +117,7 @@ func defaultGateway() (string, error) {
 			}
 		}
 	case "windows":
-		out, err := runCmd(5*time.Second, "route", "print", "0.0.0.0")
+		out, err := runCmd(ctx, 5*time.Second, "route", "print", "0.0.0.0")
 		if err != nil {
 			return "", err
 		}
@@ -125,7 +125,7 @@ func defaultGateway() (string, error) {
 			return m[1], nil
 		}
 	default: // linux
-		out, err := runCmd(3*time.Second, "ip", "route", "show", "default")
+		out, err := runCmd(ctx, 3*time.Second, "ip", "route", "show", "default")
 		if err == nil {
 			f := strings.Fields(out)
 			for i, t := range f {
@@ -151,11 +151,11 @@ func gatewayMethod() string {
 }
 
 // arpLookup returns the MAC for an IP from the system ARP/neighbor table.
-func arpLookup(ip string) (string, error) {
-	out, err := runCmd(3*time.Second, "arp", "-n", ip)
+func arpLookup(ctx context.Context, ip string) (string, error) {
+	out, err := runCmd(ctx, 3*time.Second, "arp", "-n", ip)
 	if err != nil {
 		// Windows arp wants -a
-		out, err = runCmd(3*time.Second, "arp", "-a", ip)
+		out, err = runCmd(ctx, 3*time.Second, "arp", "-a", ip)
 		if err != nil {
 			return "", err
 		}
@@ -179,7 +179,7 @@ type PingResult struct {
 	ExitInfo string
 }
 
-func ping(target string, ipv6 bool, count int) PingResult {
+func ping(ctx context.Context, target string, ipv6 bool, count int) PingResult {
 	res := PingResult{Target: target}
 	bin := "ping"
 	var args []string
@@ -208,7 +208,7 @@ func ping(target string, ipv6 bool, count int) PingResult {
 		args = []string{fam, "-c", fmt.Sprintf("%d", count), "-W", "2", target}
 	}
 	res.Cmd = bin + " " + strings.Join(args, " ")
-	out, err := runCmd(time.Duration(count+5)*time.Second, bin, args...)
+	out, err := runCmd(ctx, time.Duration(count+5)*time.Second, bin, args...)
 	return parsePing(res, out, err)
 }
 
@@ -240,7 +240,7 @@ func parsePing(res PingResult, out string, err error) PingResult {
 
 // ---- traceroute (Layer 3) ----
 
-func traceroute(target string, ipv6 bool, maxHops int) (raw string, hops int, cmd string) {
+func traceroute(ctx context.Context, target string, ipv6 bool, maxHops int) (raw string, hops int, cmd string) {
 	var name string
 	var args []string
 	switch runtime.GOOS {
@@ -266,7 +266,7 @@ func traceroute(target string, ipv6 bool, maxHops int) (raw string, hops int, cm
 		args = []string{fam, "-n", "-w", "1", "-q", "1", "-m", fmt.Sprintf("%d", maxHops), target}
 	}
 	cmd = name + " " + strings.Join(args, " ")
-	out, _ := runCmd(time.Duration(maxHops+5)*time.Second, name, args...)
+	out, _ := runCmd(ctx, time.Duration(maxHops+5)*time.Second, name, args...)
 	sc := bufio.NewScanner(strings.NewReader(out))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -279,8 +279,8 @@ func traceroute(target string, ipv6 bool, maxHops int) (raw string, hops int, cm
 
 // ---- helpers ----
 
-func runCmd(timeout time.Duration, name string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func runCmd(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
