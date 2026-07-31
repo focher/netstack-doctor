@@ -110,37 +110,51 @@ func rollup(tests []TestResult) string {
 	return worst
 }
 
-// RunAllLayers executes the 7 OSI layer suites. Layers run in parallel; each
-// layer's probes run sequentially so logs stay readable.
+// layerSuites is the fixed set of OSI layer suites, in layer order.
+var layerSuites = []func(context.Context, RunConfig) LayerResult{
+	layer1Physical,
+	layer2DataLink,
+	layer3Network,
+	layer4Transport,
+	layer5Session,
+	layer6Presentation,
+	layer7Application,
+}
+
+// RunAllLayers executes the 7 OSI layer suites and returns them in layer
+// order. Layers run in parallel; each layer's probes run sequentially so logs
+// stay readable.
 func RunAllLayers(ctx context.Context, cfg RunConfig) []LayerResult {
+	out := make([]LayerResult, len(layerSuites))
+	StreamAllLayers(ctx, cfg, func(idx int, lr LayerResult) {
+		out[idx] = lr
+	})
+	return out
+}
+
+// StreamAllLayers runs the layer suites concurrently and invokes emit as each
+// one finishes, so a caller can report progress instead of waiting for the
+// slowest layer. emit is called from the layer goroutines but serialised, so
+// implementations need no locking of their own; idx is the layer's position in
+// layer order, which is not the completion order.
+func StreamAllLayers(ctx context.Context, cfg RunConfig, emit func(idx int, lr LayerResult)) {
 	// Layers 2 and 3 both need the default gateway, and resolving it spawns an
 	// external route/ip command each time — do it once here and share it.
 	cfg.gw, cfg.gwErr = defaultGateway(ctx)
 
-	type job struct {
-		idx int
-		fn  func(context.Context, RunConfig) LayerResult
-	}
-	jobs := []job{
-		{0, layer1Physical},
-		{1, layer2DataLink},
-		{2, layer3Network},
-		{3, layer4Transport},
-		{4, layer5Session},
-		{5, layer6Presentation},
-		{6, layer7Application},
-	}
-	out := make([]LayerResult, len(jobs))
+	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, j := range jobs {
+	for i, fn := range layerSuites {
 		wg.Add(1)
-		go func(j job) {
+		go func(idx int, fn func(context.Context, RunConfig) LayerResult) {
 			defer wg.Done()
-			out[j.idx] = j.fn(ctx, cfg)
-		}(j)
+			lr := fn(ctx, cfg)
+			mu.Lock()
+			defer mu.Unlock()
+			emit(idx, lr)
+		}(i, fn)
 	}
 	wg.Wait()
-	return out
 }
 
 // ---------------- Layer 1: Physical ----------------

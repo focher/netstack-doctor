@@ -3,6 +3,8 @@ package main
 import (
 	"embed"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"net"
@@ -48,6 +50,7 @@ func main() {
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	mux.HandleFunc("/api/info", handleInfo)
 	mux.HandleFunc("/api/run", handleRun)
+	mux.HandleFunc("/api/run/stream", handleRunStream)
 	mux.HandleFunc("/api/llm/models", handleLLMModels)
 	mux.HandleFunc("/api/llm/analyze", handleLLMAnalyze)
 	mux.HandleFunc("/api/quit", handleQuit)
@@ -158,15 +161,13 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, info)
 }
 
-func handleRun(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
+// decodeRunConfig reads and validates a run request body. Shared by the JSON
+// and streaming endpoints so both apply the same defaults and the same guard
+// against values that external tools would read as flags.
+func decodeRunConfig(r *http.Request) (RunConfig, error) {
 	var cfg RunConfig
 	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return cfg, err
 	}
 	if cfg.Target == "" {
 		cfg.Target = "www.cloudflare.com"
@@ -175,15 +176,26 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		cfg.DNS = "1.1.1.1"
 	}
 	if !validTarget(cfg.Target) {
-		http.Error(w, "invalid target: must be a hostname or IP address", http.StatusBadRequest)
-		return
+		return cfg, errors.New("invalid target: must be a hostname or IP address")
 	}
 	if !validTarget(cfg.DNS) {
-		http.Error(w, "invalid dns: must be a hostname or IP address", http.StatusBadRequest)
-		return
+		return cfg, errors.New("invalid dns: must be a hostname or IP address")
 	}
 	if !cfg.IPv4 && !cfg.IPv6 {
 		cfg.IPv4 = true
+	}
+	return cfg, nil
+}
+
+func handleRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg, err := decodeRunConfig(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	// r.Context() is cancelled when the client goes away — including when the
@@ -192,6 +204,66 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	layers := RunAllLayers(r.Context(), cfg)
 	writeJSON(w, map[string]any{
+		"ranAt":      time.Now().Format(time.RFC3339),
+		"durationMs": time.Since(start).Milliseconds(),
+		"config":     cfg,
+		"layers":     layers,
+	})
+}
+
+// handleRunStream is the streaming twin of handleRun: it emits one Server-Sent
+// Event per layer as that layer finishes, then a final "done" event carrying
+// the same summary fields the JSON endpoint returns. The plain /api/run
+// endpoint stays for scripted and headless use.
+func handleRunStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg, err := decodeRunConfig(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	// Without this, a proxy sitting in front would buffer the whole stream and
+	// defeat the point of streaming at all.
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	send := func(event string, payload any) {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		flusher.Flush()
+	}
+
+	ctx := r.Context()
+	start := time.Now()
+	layers := make([]LayerResult, len(layerSuites))
+
+	send("start", map[string]any{"layers": len(layerSuites), "config": cfg})
+	StreamAllLayers(ctx, cfg, func(idx int, lr LayerResult) {
+		layers[idx] = lr
+		send("layer", lr)
+	})
+
+	if ctx.Err() != nil {
+		// The client is gone; there is nobody to receive a final event.
+		return
+	}
+	send("done", map[string]any{
 		"ranAt":      time.Now().Format(time.RFC3339),
 		"durationMs": time.Since(start).Milliseconds(),
 		"config":     cfg,
