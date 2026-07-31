@@ -33,6 +33,7 @@
       <span class="ai-label">Local LLM analysis</span>
       <select id="provider" class="field narrow">
         <option value="ollama">Ollama</option>
+        <option value="openai">OpenAI-compatible</option>
       </select>
       <input type="text" id="llmhost" class="field narrow" placeholder="127.0.0.1:11434" value="127.0.0.1:11434" />
       <button id="detect" class="ghost">Detect models</button>
@@ -47,6 +48,23 @@
     <div class="summary-item"><span class="dot yellow"></span><span id="cnt-yellow">0</span> warnings</div>
     <div class="summary-item"><span class="dot red"></span><span id="cnt-red">0</span> failed</div>
     <div class="summary-item meta" id="meta"></div>
+    <div class="summary-actions">
+      <select id="history" class="field narrow" disabled>
+        <option value="">Compare with previous run…</option>
+      </select>
+      <button id="export-md" class="ghost" disabled>Export Markdown</button>
+      <button id="export-json" class="ghost" disabled>Export JSON</button>
+    </div>
+  </section>
+
+  <section id="diffpanel" class="aipanel" hidden>
+    <div class="aipanel-head">
+      <span class="ai-icon">⇄</span>
+      <h3>Changes since the selected run</h3>
+      <span id="diffpanel-meta" class="muted"></span>
+      <button id="diffpanel-close" class="iconbtn">✕</button>
+    </div>
+    <div id="diffpanel-body" class="aipanel-body"></div>
   </section>
 
   <section id="aipanel" class="aipanel" hidden>
@@ -79,6 +97,7 @@
   </div>
 
   <footer class="foot"><span id="platform"></span> · NetStack Doctor</footer>
+  <script src="report.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

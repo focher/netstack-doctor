@@ -69,11 +69,22 @@ func (l *logger) block(label, body string) {
 	l.add("└─")
 }
 
-func timed(name string, fn func(l *logger) (string, string)) TestResult {
+func timed(ctx context.Context, name string, fn func(l *logger) (string, string)) TestResult {
 	start := time.Now()
 	l := &logger{start: start}
+	// Already cancelled: don't start work that nobody is waiting for.
+	if ctx.Err() != nil {
+		return TestResult{Name: name, Status: Gray, Summary: "Cancelled before this probe ran",
+			Logs: []string{"run cancelled before this probe started"}}
+	}
 	l.step("probe %q started on %s/%s", name, runtime.GOOS, runtime.GOARCH)
 	status, summary := fn(l)
+	// A probe that failed *because* the run was cancelled is not a finding —
+	// report it as skipped so a cancelled run doesn't look like a broken network.
+	if ctx.Err() != nil && status == Red {
+		l.step("run cancelled mid-probe; reporting as skipped rather than failed")
+		status, summary = Gray, "Cancelled mid-probe"
+	}
 	l.step("probe finished: status=%s summary=%q", status, summary)
 	return TestResult{
 		Name:       name,
@@ -99,41 +110,59 @@ func rollup(tests []TestResult) string {
 	return worst
 }
 
-// RunAllLayers executes the 7 OSI layer suites. Layers run in parallel; each
-// layer's probes run sequentially so logs stay readable.
-func RunAllLayers(cfg RunConfig) []LayerResult {
-	type job struct {
-		idx int
-		fn  func(RunConfig) LayerResult
-	}
-	jobs := []job{
-		{0, layer1Physical},
-		{1, layer2DataLink},
-		{2, layer3Network},
-		{3, layer4Transport},
-		{4, layer5Session},
-		{5, layer6Presentation},
-		{6, layer7Application},
-	}
-	out := make([]LayerResult, len(jobs))
+// layerSuites is the fixed set of OSI layer suites, in layer order.
+var layerSuites = []func(context.Context, RunConfig) LayerResult{
+	layer1Physical,
+	layer2DataLink,
+	layer3Network,
+	layer4Transport,
+	layer5Session,
+	layer6Presentation,
+	layer7Application,
+}
+
+// RunAllLayers executes the 7 OSI layer suites and returns them in layer
+// order. Layers run in parallel; each layer's probes run sequentially so logs
+// stay readable.
+func RunAllLayers(ctx context.Context, cfg RunConfig) []LayerResult {
+	out := make([]LayerResult, len(layerSuites))
+	StreamAllLayers(ctx, cfg, func(idx int, lr LayerResult) {
+		out[idx] = lr
+	})
+	return out
+}
+
+// StreamAllLayers runs the layer suites concurrently and invokes emit as each
+// one finishes, so a caller can report progress instead of waiting for the
+// slowest layer. emit is called from the layer goroutines but serialised, so
+// implementations need no locking of their own; idx is the layer's position in
+// layer order, which is not the completion order.
+func StreamAllLayers(ctx context.Context, cfg RunConfig, emit func(idx int, lr LayerResult)) {
+	// Layers 2 and 3 both need the default gateway, and resolving it spawns an
+	// external route/ip command each time — do it once here and share it.
+	cfg.gw, cfg.gwErr = defaultGateway(ctx)
+
+	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, j := range jobs {
+	for i, fn := range layerSuites {
 		wg.Add(1)
-		go func(j job) {
+		go func(idx int, fn func(context.Context, RunConfig) LayerResult) {
 			defer wg.Done()
-			out[j.idx] = j.fn(cfg)
-		}(j)
+			lr := fn(ctx, cfg)
+			mu.Lock()
+			defer mu.Unlock()
+			emit(idx, lr)
+		}(i, fn)
 	}
 	wg.Wait()
-	return out
 }
 
 // ---------------- Layer 1: Physical ----------------
 
-func layer1Physical(cfg RunConfig) LayerResult {
+func layer1Physical(ctx context.Context, cfg RunConfig) LayerResult {
 	var tests []TestResult
 
-	tests = append(tests, timed("Active network interfaces", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "Active network interfaces", func(l *logger) (string, string) {
 		l.step("enumerating link-layer interfaces via net.Interfaces() syscall")
 		ifaces := interfaceSummary()
 		l.step("kernel reported %d total interface(s)", len(ifaces))
@@ -170,7 +199,7 @@ func layer1Physical(cfg RunConfig) LayerResult {
 		return Green, fmt.Sprintf("%d active physical interface(s)", active)
 	}))
 
-	tests = append(tests, timed("Link MTU sanity", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "Link MTU sanity", func(l *logger) (string, string) {
 		l.step("inspecting MTU of each active link (1280=IPv6 min, 1500=ethernet std, >1500=jumbo)")
 		ifaces := interfaceSummary()
 		low := 0
@@ -207,12 +236,12 @@ func layer1Physical(cfg RunConfig) LayerResult {
 
 // ---------------- Layer 2: Data Link ----------------
 
-func layer2DataLink(cfg RunConfig) LayerResult {
+func layer2DataLink(ctx context.Context, cfg RunConfig) LayerResult {
 	var tests []TestResult
 
-	gw, gwErr := defaultGateway()
+	gw, gwErr := cfg.gw, cfg.gwErr
 
-	tests = append(tests, timed("Default gateway discovery", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "Default gateway discovery", func(l *logger) (string, string) {
 		l.step("querying OS routing table for default route (0.0.0.0/0)")
 		l.add("method: %s", gatewayMethod())
 		if gwErr != nil {
@@ -221,23 +250,23 @@ func layer2DataLink(cfg RunConfig) LayerResult {
 		}
 		l.step("default gateway resolved to %s", gw)
 		l.add("default gateway = %s", gw)
-		return Green, "Default gateway: "+gw
+		return Green, "Default gateway: " + gw
 	}))
 
-	tests = append(tests, timed("Gateway ARP / L2 reachability", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "Gateway ARP / L2 reachability", func(l *logger) (string, string) {
 		if gwErr != nil {
 			l.step("no gateway available, skipping")
 			return Gray, "No gateway to resolve"
 		}
 		// Prime the ARP cache with a ping first.
 		l.step("priming neighbor cache: %s", "ping "+gw)
-		pr := ping(gw, false, 2)
+		pr := ping(ctx, gw, false, 2)
 		l.add("exec: %s", pr.Cmd)
 		l.block("ping output", pr.Raw)
 		l.add("result: reachable=%v loss=%s avg=%.2fms (%s)", pr.OK, emptyDash(pr.Loss), pr.AvgMs, pr.ExitInfo)
 		l.step("resolving L2 hardware address from ARP/neighbor table")
 		l.add("exec: arp -n %s  (fallback: arp -a %s)", gw, gw)
-		mac, err := arpLookup(gw)
+		mac, err := arpLookup(ctx, gw)
 		if err != nil {
 			l.add("arp lookup failed: %v", err)
 			if pr.OK {
@@ -248,10 +277,10 @@ func layer2DataLink(cfg RunConfig) LayerResult {
 		l.step("gateway L2 (MAC) address = %s", mac)
 		l.add("gateway MAC = %s", mac)
 		l.add("OUI (vendor prefix) = %s", ouiPrefix(mac))
-		return Green, "Gateway L2 address resolved: "+mac
+		return Green, "Gateway L2 address resolved: " + mac
 	}))
 
-	tests = append(tests, timed("MAC addressing present", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "MAC addressing present", func(l *logger) (string, string) {
 		ifaces := interfaceSummary()
 		withMAC := 0
 		for _, ifc := range ifaces {
@@ -271,11 +300,11 @@ func layer2DataLink(cfg RunConfig) LayerResult {
 
 // ---------------- Layer 3: Network ----------------
 
-func layer3Network(cfg RunConfig) LayerResult {
+func layer3Network(ctx context.Context, cfg RunConfig) LayerResult {
 	var tests []TestResult
 	v4, v6 := localAddrs()
 
-	tests = append(tests, timed("IP address assignment", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "IP address assignment", func(l *logger) (string, string) {
 		l.step("collecting routable unicast addresses from all non-loopback links")
 		l.add("IPv4 addresses (%d):", len(v4))
 		for _, a := range v4 {
@@ -300,10 +329,11 @@ func layer3Network(cfg RunConfig) LayerResult {
 	}))
 
 	// Gateway ping
-	if gw, err := defaultGateway(); err == nil {
-		tests = append(tests, timed("Ping default gateway", func(l *logger) (string, string) {
+	if cfg.gwErr == nil {
+		gw := cfg.gw
+		tests = append(tests, timed(ctx, "Ping default gateway", func(l *logger) (string, string) {
 			l.step("ICMP echo to default gateway %s (3 packets)", gw)
-			pr := ping(gw, false, 3)
+			pr := ping(ctx, gw, false, 3)
 			l.add("exec: %s", pr.Cmd)
 			l.block("raw ping output", pr.Raw)
 			l.add("exit: %s", pr.ExitInfo)
@@ -317,13 +347,13 @@ func layer3Network(cfg RunConfig) LayerResult {
 
 	// Public reachability per family
 	addFamilyPing := func(label, host string, v6 bool) {
-		tests = append(tests, timed("Ping "+label, func(l *logger) (string, string) {
+		tests = append(tests, timed(ctx, "Ping "+label, func(l *logger) (string, string) {
 			fam := "IPv4"
 			if v6 {
 				fam = "IPv6"
 			}
 			l.step("ICMP echo to public %s anchor %s (3 packets)", fam, host)
-			pr := ping(host, v6, 3)
+			pr := ping(ctx, host, v6, 3)
 			l.add("exec: %s", pr.Cmd)
 			l.block("raw ping output", pr.Raw)
 			l.add("exit: %s", pr.ExitInfo)
@@ -334,7 +364,7 @@ func layer3Network(cfg RunConfig) LayerResult {
 			if pr.OK {
 				return Green, fmt.Sprintf("%s reachable (%.0f ms)", host, pr.AvgMs)
 			}
-			return Red, host+" unreachable (ICMP may be filtered)"
+			return Red, host + " unreachable (ICMP may be filtered)"
 		}))
 	}
 	if cfg.IPv4 {
@@ -348,17 +378,39 @@ func layer3Network(cfg RunConfig) LayerResult {
 		}
 	}
 
-	// Traceroute path
-	tests = append(tests, timed("Path / traceroute to "+cfg.Target, func(l *logger) (string, string) {
-		l.step("tracing network path to %s (max 20 hops)", cfg.Target)
-		raw, hops, cmd := traceroute(cfg.Target, false, 20)
-		l.add("exec: %s", cmd)
-		l.block("raw traceroute output", raw)
-		l.step("counted %d responding hop(s)", hops)
-		if hops == 0 {
-			return Yellow, "No traceroute hops returned"
+	// Traceroute path, per requested family.
+	addTrace := func(label string, v6 bool) {
+		tests = append(tests, timed(ctx, label, func(l *logger) (string, string) {
+			fam := "IPv4"
+			if v6 {
+				fam = "IPv6"
+			}
+			l.step("tracing %s network path to %s (max 20 hops)", fam, cfg.Target)
+			raw, hops, cmd := traceroute(ctx, cfg.Target, v6, 20)
+			l.add("exec: %s", cmd)
+			l.block("raw traceroute output", raw)
+			l.step("counted %d responding hop(s)", hops)
+			if hops == 0 {
+				return Yellow, "No traceroute hops returned"
+			}
+			return Green, fmt.Sprintf("%d hop(s) along the path", hops)
+		}))
+	}
+	if cfg.IPv4 {
+		addTrace("Path / traceroute to "+cfg.Target+" (IPv4)", false)
+	}
+	if cfg.IPv6 {
+		if len(v6) > 0 {
+			addTrace("Path / traceroute to "+cfg.Target+" (IPv6)", true)
+		} else {
+			tests = append(tests, skipped("Path / traceroute to "+cfg.Target+" (IPv6)",
+				"No global IPv6 address on this host"))
 		}
-		return Green, fmt.Sprintf("%d hop(s) along the path", hops)
+	}
+
+	// Public IP / NAT detection.
+	tests = append(tests, timed(ctx, "Public IP & NAT detection", func(l *logger) (string, string) {
+		return publicIPProbe(ctx, cfg, l, v4, v6)
 	}))
 
 	return LayerResult{3, "Network", "IP routing, gateway, ICMP, path", rollup(tests), tests}
@@ -366,18 +418,18 @@ func layer3Network(cfg RunConfig) LayerResult {
 
 // ---------------- Layer 4: Transport ----------------
 
-func layer4Transport(cfg RunConfig) LayerResult {
+func layer4Transport(ctx context.Context, cfg RunConfig) LayerResult {
 	var tests []TestResult
 
 	tcpProbe := func(label, host string, port int, v6 bool) {
-		tests = append(tests, timed(label, func(l *logger) (string, string) {
+		tests = append(tests, timed(ctx, label, func(l *logger) (string, string) {
 			network := "tcp4"
 			if v6 {
 				network = "tcp6"
 			}
 			addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 			l.step("resolving %s for family %s", host, network)
-			if ips, rerr := net.LookupHost(host); rerr == nil {
+			if ips, rerr := net.DefaultResolver.LookupHost(ctx, host); rerr == nil {
 				for _, ip := range ips {
 					l.add("  candidate %s", ip)
 				}
@@ -387,7 +439,7 @@ func layer4Transport(cfg RunConfig) LayerResult {
 			l.step("opening TCP socket to %s (SYN -> SYN/ACK -> ACK), 4s timeout", addr)
 			start := time.Now()
 			d := net.Dialer{Timeout: 4 * time.Second}
-			conn, err := d.Dial(network, addr)
+			conn, err := d.DialContext(ctx, network, addr)
 			if err != nil {
 				l.add("dial %s %s FAILED after %s", network, addr, time.Since(start).Round(time.Millisecond))
 				l.add("error: %v", err)
@@ -423,12 +475,12 @@ func layer4Transport(cfg RunConfig) LayerResult {
 	}
 
 	// UDP DNS round-trip (connectionless transport)
-	tests = append(tests, timed("UDP/53 round-trip ("+cfg.DNS+")", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "UDP/53 round-trip ("+cfg.DNS+")", func(l *logger) (string, string) {
 		l.step("building raw DNS/UDP query packet (type A) for %q", cfg.Target)
 		l.add("dns server  : %s:53 (UDP, connectionless)", cfg.DNS)
 		l.add("query packet: %s", hexPreview(buildDNSQuery(cfg.Target)))
 		l.step("sending datagram and awaiting response (3s deadline)")
-		ms, err := udpDNSRoundTrip(cfg.DNS, cfg.Target)
+		ms, err := udpDNSRoundTrip(ctx, cfg.DNS, cfg.Target)
 		if err != nil {
 			l.add("udp dns error: %v", err)
 			return Red, "UDP DNS query failed"
@@ -438,7 +490,7 @@ func layer4Transport(cfg RunConfig) LayerResult {
 	}))
 
 	// Ephemeral port / local stack check
-	tests = append(tests, timed("Local TCP stack (ephemeral bind)", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "Local TCP stack (ephemeral bind)", func(l *logger) (string, string) {
 		l.step("requesting kernel to bind an ephemeral TCP port on 127.0.0.1")
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -454,13 +506,17 @@ func layer4Transport(cfg RunConfig) LayerResult {
 	return LayerResult{4, "Transport", "TCP/UDP ports, handshakes, sockets", rollup(tests), tests}
 }
 
-func udpDNSRoundTrip(server, name string) (int64, error) {
+func udpDNSRoundTrip(ctx context.Context, server, name string) (int64, error) {
 	addr := net.JoinHostPort(server, "53")
-	conn, err := net.DialTimeout("udp", addr, 3*time.Second)
+	d := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := d.DialContext(ctx, "udp", addr)
 	if err != nil {
 		return 0, err
 	}
 	defer conn.Close()
+	// Close the socket if the run is cancelled, so a pending Read unblocks.
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
 	conn.SetDeadline(time.Now().Add(3 * time.Second))
 	query := buildDNSQuery(name)
 	start := time.Now()
@@ -485,35 +541,35 @@ func buildDNSQuery(name string) []byte {
 		msg = append(msg, byte(len(label)))
 		msg = append(msg, []byte(label)...)
 	}
-	msg = append(msg, 0x00)             // root
-	msg = append(msg, 0x00, 0x01)       // type A
-	msg = append(msg, 0x00, 0x01)       // class IN
+	msg = append(msg, 0x00)       // root
+	msg = append(msg, 0x00, 0x01) // type A
+	msg = append(msg, 0x00, 0x01) // class IN
 	return msg
 }
 
 // ---------------- Layer 5: Session ----------------
 
-func layer5Session(cfg RunConfig) LayerResult {
+func layer5Session(ctx context.Context, cfg RunConfig) LayerResult {
 	var tests []TestResult
 
-	tests = append(tests, timed("TLS session establishment", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "TLS session establishment", func(l *logger) (string, string) {
 		l.step("establishing a stateful TLS session with %s:443", cfg.Target)
-		state, err := tlsHandshake(cfg.Target, false, l)
+		state, err := tlsHandshake(ctx, cfg.Target, false, l)
 		if err != nil {
 			return Red, "Could not establish session"
 		}
 		l.add("session established: version=%s cipher=%s", tlsVersionName(state.Version), tls.CipherSuiteName(state.CipherSuite))
 		l.add("ALPN protocol     : %s", emptyDash(state.NegotiatedProtocol))
 		l.add("OCSP stapled      : %v", len(state.OCSPResponse) > 0)
-		return Green, "Session established with "+cfg.Target
+		return Green, "Session established with " + cfg.Target
 	}))
 
-	tests = append(tests, timed("TLS session resumption", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "TLS session resumption", func(l *logger) (string, string) {
 		cache := tls.NewLRUClientSessionCache(4)
 		dial := func(n int) (bool, error) {
 			t0 := time.Now()
 			d := net.Dialer{Timeout: 5 * time.Second}
-			raw, err := d.Dial("tcp", net.JoinHostPort(cfg.Target, "443"))
+			raw, err := d.DialContext(ctx, "tcp", net.JoinHostPort(cfg.Target, "443"))
 			if err != nil {
 				return false, err
 			}
@@ -545,13 +601,14 @@ func layer5Session(cfg RunConfig) LayerResult {
 		return Yellow, "Sessions work but server did not resume (full handshake)"
 	}))
 
-	tests = append(tests, timed("HTTP keep-alive (persistent session)", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "HTTP keep-alive (persistent session)", func(l *logger) (string, string) {
 		l.step("issuing 2 sequential HTTPS requests over one keep-alive connection")
 		client := &http.Client{Timeout: 8 * time.Second}
 		url := "https://" + cfg.Target + "/"
 		for i := 1; i <= 2; i++ {
 			t0 := time.Now()
-			resp, err := client.Get(url)
+			req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+			resp, err := client.Do(req)
 			if err != nil {
 				l.add("request %d failed: %v", i, err)
 				return Red, "Persistent session failed"
@@ -567,14 +624,14 @@ func layer5Session(cfg RunConfig) LayerResult {
 	return LayerResult{5, "Session", "Session setup, resumption, keep-alive", rollup(tests), tests}
 }
 
-func tlsHandshake(host string, v6 bool, l *logger) (tls.ConnectionState, error) {
+func tlsHandshake(ctx context.Context, host string, v6 bool, l *logger) (tls.ConnectionState, error) {
 	network := "tcp"
 	if v6 {
 		network = "tcp6"
 	}
 	d := net.Dialer{Timeout: 6 * time.Second}
 	l.step("dialing TCP %s for TLS", net.JoinHostPort(host, "443"))
-	raw, err := d.Dial(network, net.JoinHostPort(host, "443"))
+	raw, err := d.DialContext(ctx, network, net.JoinHostPort(host, "443"))
 	if err != nil {
 		l.add("dial error: %v", err)
 		return tls.ConnectionState{}, err
@@ -606,28 +663,36 @@ func tlsHandshake(host string, v6 bool, l *logger) (tls.ConnectionState, error) 
 
 // ---------------- Layer 6: Presentation ----------------
 
-func layer6Presentation(cfg RunConfig) LayerResult {
+func layer6Presentation(ctx context.Context, cfg RunConfig) LayerResult {
 	var tests []TestResult
 
-	tests = append(tests, timed("TLS version & cipher negotiation", func(l *logger) (string, string) {
-		st, err := tlsHandshake(cfg.Target, false, l)
-		if err != nil {
+	// One handshake serves both probes below: they hit the same endpoint with
+	// the same config, so a second full dial+handshake adds a network
+	// round-trip without producing any new information. Probes within a layer
+	// run sequentially, so sharing state here is race-free.
+	var st tls.ConnectionState
+	var hsErr error
+
+	tests = append(tests, timed(ctx, "TLS version & cipher negotiation", func(l *logger) (string, string) {
+		st, hsErr = tlsHandshake(ctx, cfg.Target, false, l)
+		if hsErr != nil {
 			return Red, "TLS negotiation failed"
 		}
 		l.add("version = %s", tlsVersionName(st.Version))
 		l.add("cipher  = %s", tls.CipherSuiteName(st.CipherSuite))
 		l.add("ALPN    = %s", emptyDash(st.NegotiatedProtocol))
 		if st.Version < tls.VersionTLS12 {
-			return Yellow, "Negotiated outdated TLS ("+tlsVersionName(st.Version)+")"
+			return Yellow, "Negotiated outdated TLS (" + tlsVersionName(st.Version) + ")"
 		}
 		return Green, fmt.Sprintf("%s / %s", tlsVersionName(st.Version), tls.CipherSuiteName(st.CipherSuite))
 	}))
 
-	tests = append(tests, timed("Certificate chain validation", func(l *logger) (string, string) {
-		st, err := tlsHandshake(cfg.Target, false, l)
-		if err != nil {
+	tests = append(tests, timed(ctx, "Certificate chain validation", func(l *logger) (string, string) {
+		if hsErr != nil {
+			l.add("handshake failed in the negotiation probe: %v", hsErr)
 			return Red, "Could not retrieve certificate"
 		}
+		l.step("reusing TLS state from the negotiation probe (no second handshake)")
 		if len(st.PeerCertificates) == 0 {
 			return Red, "No certificate presented"
 		}
@@ -666,8 +731,8 @@ func layer6Presentation(cfg RunConfig) LayerResult {
 		return Green, fmt.Sprintf("Trusted certificate, %.0f days remaining", days)
 	}))
 
-	tests = append(tests, timed("Content compression support", func(l *logger) (string, string) {
-		req, _ := http.NewRequest("GET", "https://"+cfg.Target+"/", nil)
+	tests = append(tests, timed(ctx, "Content compression support", func(l *logger) (string, string) {
+		req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+cfg.Target+"/", nil)
 		req.Header.Set("Accept-Encoding", "gzip, br")
 		client := &http.Client{Timeout: 8 * time.Second,
 			Transport: &http.Transport{DisableCompression: true}}
@@ -683,7 +748,7 @@ func layer6Presentation(cfg RunConfig) LayerResult {
 		if enc == "" {
 			return Yellow, "Server returned uncompressed payload"
 		}
-		return Green, "Presentation-layer encoding negotiated ("+enc+")"
+		return Green, "Presentation-layer encoding negotiated (" + enc + ")"
 	}))
 
 	return LayerResult{6, "Presentation", "TLS, certificates, encoding/compression", rollup(tests), tests}
@@ -691,13 +756,19 @@ func layer6Presentation(cfg RunConfig) LayerResult {
 
 // ---------------- Layer 7: Application ----------------
 
-func layer7Application(cfg RunConfig) LayerResult {
+func layer7Application(ctx context.Context, cfg RunConfig) LayerResult {
 	var tests []TestResult
 
+	// Captive portal — checked first, because a portal makes every probe below
+	// it look healthy while the user has no real internet access.
+	tests = append(tests, timed(ctx, "Captive portal detection", func(l *logger) (string, string) {
+		return captivePortalProbe(ctx, l)
+	}))
+
 	// DNS resolution — A records
-	tests = append(tests, timed("DNS resolution — A (IPv4)", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "DNS resolution — A (IPv4)", func(l *logger) (string, string) {
 		l.step("resolving A records for %q via system resolver", cfg.Target)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		if cn, e := net.DefaultResolver.LookupCNAME(ctx, cfg.Target); e == nil {
 			l.add("canonical name (CNAME): %s", cn)
@@ -720,15 +791,15 @@ func layer7Application(cfg RunConfig) LayerResult {
 
 	// DNS resolution — AAAA records
 	if cfg.IPv6 {
-		tests = append(tests, timed("DNS resolution — AAAA (IPv6)", func(l *logger) (string, string) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		tests = append(tests, timed(ctx, "DNS resolution — AAAA (IPv6)", func(l *logger) (string, string) {
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			ips, err := net.DefaultResolver.LookupIP(ctx, "ip6", cfg.Target)
 			if err != nil || len(ips) == 0 {
 				if err != nil {
 					l.add("lookup error: %v", err)
 				}
-				return Yellow, "No AAAA (IPv6) records for "+cfg.Target
+				return Yellow, "No AAAA (IPv6) records for " + cfg.Target
 			}
 			for _, ip := range ips {
 				l.add("AAAA %s", ip.String())
@@ -738,26 +809,27 @@ func layer7Application(cfg RunConfig) LayerResult {
 	}
 
 	// Reverse DNS / PTR for the configured resolver
-	tests = append(tests, timed("Reverse DNS (PTR) of resolver", func(l *logger) (string, string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	tests = append(tests, timed(ctx, "Reverse DNS (PTR) of resolver", func(l *logger) (string, string) {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		names, err := net.DefaultResolver.LookupAddr(ctx, cfg.DNS)
 		if err != nil || len(names) == 0 {
 			l.add("ptr error/empty: %v", err)
-			return Yellow, "No PTR record for "+cfg.DNS
+			return Yellow, "No PTR record for " + cfg.DNS
 		}
 		for _, n := range names {
 			l.add("PTR %s", n)
 		}
-		return Green, "Reverse DNS resolves: "+strings.TrimSuffix(names[0], ".")
+		return Green, "Reverse DNS resolves: " + strings.TrimSuffix(names[0], ".")
 	}))
 
 	// HTTPS application request
-	tests = append(tests, timed("HTTPS application request", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "HTTPS application request", func(l *logger) (string, string) {
 		client := &http.Client{Timeout: 10 * time.Second}
 		start := time.Now()
 		l.step("GET https://%s/ (10s timeout, following redirects)", cfg.Target)
-		resp, err := client.Get("https://" + cfg.Target + "/")
+		req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+cfg.Target+"/", nil)
+		resp, err := client.Do(req)
 		if err != nil {
 			l.add("GET error: %v", err)
 			return Red, "HTTPS request failed"
@@ -779,14 +851,15 @@ func layer7Application(cfg RunConfig) LayerResult {
 	}))
 
 	// Plain HTTP (port 80) redirect/availability
-	tests = append(tests, timed("HTTP/80 availability", func(l *logger) (string, string) {
+	tests = append(tests, timed(ctx, "HTTP/80 availability", func(l *logger) (string, string) {
 		client := &http.Client{
 			Timeout: 8 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		}
-		resp, err := client.Get("http://" + cfg.Target + "/")
+		req, _ := http.NewRequestWithContext(ctx, "GET", "http://"+cfg.Target+"/", nil)
+		resp, err := client.Do(req)
 		if err != nil {
 			l.add("GET error: %v", err)
 			return Yellow, "Port 80 not reachable (may be HTTPS-only)"
@@ -800,7 +873,7 @@ func layer7Application(cfg RunConfig) LayerResult {
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			return Green, "HTTP/80 redirects to secure endpoint"
 		}
-		return Green, "HTTP/80 responded: "+resp.Status
+		return Green, "HTTP/80 responded: " + resp.Status
 	}))
 
 	return LayerResult{7, "Application", "DNS, HTTP/HTTPS, app protocols", rollup(tests), tests}
@@ -865,4 +938,3 @@ func tlsVersionName(v uint16) string {
 	}
 	return fmt.Sprintf("0x%04x", v)
 }
-

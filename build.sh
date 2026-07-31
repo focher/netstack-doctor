@@ -4,11 +4,12 @@
 # The GUI uses a native webview (WKWebView on macOS, WebView2 on Windows) via
 # cgo, so each platform's GUI binary must be built ON that platform (cgo cannot
 # cross-compile the native webview). macOS is built here; Windows is built by
-# the GitHub Actions workflow (.github/workflows/release.yml) on a Windows runner.
+# the GitHub Actions workflow (.github/workflows/release.yml) on a Windows
+# runner, or locally with scripts/make-windows-installer.ps1.
 #
 # Usage:
 #   ./build.sh                 macOS .app bundle (default)
-#   ./build.sh dmg             distributable .dmg (app + Gatekeeper-bypass installer)
+#   ./build.sh dmg             distributable .dmg (app + drag-to-Applications + Gatekeeper installer)
 #   ./build.sh package         dmg + checksums for release
 #   ./build.sh headless        portable server-only binary (no GUI, any OS via cross-compile)
 set -euo pipefail

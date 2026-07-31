@@ -12,18 +12,66 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.26.x" }
+      # build.sh is the single source of truth for the version number.
+      - name: Resolve version
+        run: |
+          $m = Select-String -Path build.sh -Pattern '^VERSION="([^"]+)"' | Select-Object -First 1
+          if (-not $m) { throw "could not read VERSION from build.sh" }
+          $v = $m.Matches[0].Groups[1].Value
+          "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Version: $v"
       # WebView2 runtime ships with Windows 10/11; the loader is vendored by webview_go.
       - name: Build standalone GUI app (amd64)
         env: { CGO_ENABLED: "1" }
         run: |
           go build -ldflags "-s -w -H windowsgui" -o "NetStack Doctor.exe" .
-      - name: Package
+      # Inno Setup is preinstalled on the runner image but is not on PATH.
+      - name: Put Inno Setup on PATH
+        run: |
+          if (Get-Command iscc.exe -ErrorAction SilentlyContinue) { exit 0 }
+          $dir = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          if (-not (Test-Path "$dir\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+          if (-not (Test-Path "$dir\ISCC.exe")) { throw "Inno Setup not found at $dir" }
+          $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build installer (adds Start Menu entry)
+        run: |
+          iscc "/DAppVersion=$env:VERSION" "installer\netstack-doctor.iss"
+      # The zip stays as a portable, no-install option alongside the installer.
+      - name: Package portable zip
         run: |
           Compress-Archive -Path "NetStack Doctor.exe","README.md" -DestinationPath "netstack-doctor-windows-amd64.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: windows-amd64
-          path: netstack-doctor-windows-amd64.zip
+          path: |
+            netstack-doctor-windows-amd64.zip
+            dist/*setup.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26.x" }
+      # webview_go binds WebKitGTK through cgo, so the GUI build needs the dev
+      # headers. 24.04 ships only 4.1; make-linux-app.sh shims the 4.0 module
+      # name that webview_go asks for onto it.
+      - name: Install WebKitGTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
+      - name: Build GUI app (.deb + tarball)
+        run: |
+          VERSION=$(sed -n 's/^VERSION="\(.*\)"/\1/p' build.sh | head -1)
+          bash scripts/make-linux-app.sh "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
 
   macos:
     runs-on: macos-14   # Apple Silicon
@@ -39,7 +87,7 @@ jobs:
           path: dist/*.dmg
 
   release:
-    needs: [windows, macos]
+    needs: [windows, linux, macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions: { contents: write }
@@ -50,4 +98,5 @@ jobs:
         with:
           files: |
             windows-amd64/*
+            linux-amd64/*
             macos-arm64/*

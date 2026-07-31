@@ -32,10 +32,12 @@ function statusWord(s) {
 }
 
 function skeleton() {
+  lastLayers = [];
   grid.innerHTML = "";
   LAYER_META.forEach((m) => {
     const card = document.createElement("section");
     card.className = "card skeleton";
+    card.id = "card-" + m.layer;
     card.innerHTML = `
       <div class="card-head">
         <div class="badge gray">${m.layer}</div>
@@ -49,13 +51,12 @@ function skeleton() {
   });
 }
 
-function render(layers) {
-  lastLayers = layers;
-  grid.innerHTML = "";
-  layers.sort((a, b) => a.layer - b.layer).forEach((L) => {
-    const card = document.createElement("section");
-    card.className = "card";
-    const tests = L.tests.map((t, i) => `
+// Build the card for one completed layer.
+function layerCard(L) {
+  const card = document.createElement("section");
+  card.className = "card";
+  card.id = "card-" + L.layer;
+  const tests = L.tests.map((t, i) => `
       <li class="test" data-layer="${L.layer}" data-idx="${i}">
         <span class="tdot" style="background:var(--${t.status})"></span>
         <div class="tbody">
@@ -65,32 +66,54 @@ function render(layers) {
         <span class="tdur">${t.durationMs}ms</span>
         <span class="chev">›</span>
       </li>`).join("");
-    card.innerHTML = `
+  card.innerHTML = `
       <div class="card-head">
         <div class="badge ${L.status}">${L.layer}</div>
-        <div><h2>${L.name}</h2><div class="purpose">${L.purpose}</div></div>
+        <div><h2>${escapeHtml(L.name)}</h2><div class="purpose">${escapeHtml(L.purpose)}</div></div>
         <div class="status-pill ${L.status}">${statusWord(L.status)}</div>
       </div>
       <ul class="tests">${tests}</ul>`;
-    grid.appendChild(card);
-  });
-
-  grid.querySelectorAll(".test").forEach((el) => {
-    el.addEventListener("click", () => {
-      const L = lastLayers.find((x) => x.layer == el.dataset.layer);
-      openModal(L, L.tests[el.dataset.idx]);
-    });
-  });
+  return card;
 }
 
-function updateSummary(data) {
+// Swap one layer's skeleton for its result the moment that layer lands, so the
+// grid fills in progressively instead of all at once at the end.
+function renderLayer(L) {
+  lastLayers = lastLayers.filter((x) => x.layer !== L.layer).concat(L);
+  const card = layerCard(L);
+  const existing = document.getElementById("card-" + L.layer);
+  if (existing) existing.replaceWith(card);
+  else grid.appendChild(card);
+}
+
+function render(layers) {
+  skeleton();
+  layers.slice().sort((a, b) => a.layer - b.layer).forEach(renderLayer);
+}
+
+// Test rows are re-created as each layer streams in, so bind once on the grid
+// rather than per row.
+grid.addEventListener("click", (e) => {
+  const el = e.target.closest(".test");
+  if (!el) return;
+  const L = lastLayers.find((x) => x.layer == el.dataset.layer);
+  if (L) openModal(L, L.tests[el.dataset.idx]);
+});
+
+// Status tallies, recomputed from whatever layers have arrived so far.
+function updateCounts() {
   let g = 0, y = 0, r = 0;
-  data.layers.forEach((L) => L.tests.forEach((t) => {
+  lastLayers.forEach((L) => L.tests.forEach((t) => {
     if (t.status === "green") g++; else if (t.status === "yellow") y++; else if (t.status === "red") r++;
   }));
   $("cnt-green").textContent = g;
   $("cnt-yellow").textContent = y;
   $("cnt-red").textContent = r;
+  $("summary").hidden = false;
+}
+
+function updateSummary(data) {
+  updateCounts();
   $("meta").textContent = `${data.config.target} · ran in ${(data.durationMs / 1000).toFixed(1)}s · ${new Date(data.ranAt).toLocaleTimeString()}`;
   $("summary").hidden = false;
 }
@@ -107,9 +130,56 @@ $("modal-close").addEventListener("click", () => ($("modal").hidden = true));
 $("modal").addEventListener("click", (e) => { if (e.target.id === "modal") $("modal").hidden = true; });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("modal").hidden = true; });
 
-async function run() {
+// Minimal Server-Sent Events reader over a fetch body. EventSource can't be
+// used here: the run is a POST carrying a JSON config, and EventSource only
+// issues GETs.
+async function consumeSSE(stream, onEvent) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      let event = "message", data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+      let parsed;
+      try { parsed = JSON.parse(data); } catch { continue; }
+      onEvent(event, parsed);
+    }
+  }
+}
+
+// Non-null only while a run is in flight. Aborting it drops the HTTP
+// connection, which cancels the request context server-side and stops the
+// probes mid-flight rather than letting every timeout play out.
+let runAbort = null;
+
+function setRunning(on) {
   const btn = $("run");
-  btn.disabled = true; btn.textContent = "Running…";
+  btn.textContent = on ? "Cancel" : "Run diagnostics";
+  btn.classList.toggle("danger", on);
+  btn.disabled = false;
+}
+
+function cancelRun() {
+  if (runAbort) runAbort.abort();
+}
+
+async function run() {
+  // While a run is in flight the primary button is the cancel control.
+  if (runAbort) { cancelRun(); return; }
+
+  runAbort = new AbortController();
+  setRunning(true);
   $("empty") && ($("empty").style.display = "none");
   skeleton();
   try {
@@ -119,20 +189,41 @@ async function run() {
       target: $("target").value.trim(),
       dns: $("dns").value.trim(),
     };
-    const r = await fetch("/api/run", {
+    const r = await fetch("/api/run/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cfg),
+      signal: runAbort.signal,
     });
-    const data = await r.json();
-    lastRunData = data;
-    render(data.layers);
-    updateSummary(data);
-    updateAnalyzeButton();
+    if (!r.ok) throw new Error((await r.text()).trim() || `HTTP ${r.status}`);
+    await consumeSSE(r.body, (event, data) => {
+      if (event === "layer") {
+        renderLayer(data);
+        updateCounts();
+      } else if (event === "done") {
+        // The final event is authoritative; re-render only if a layer event
+        // was somehow missed, to avoid a needless flash of the whole grid.
+        if (lastLayers.length !== data.layers.length) render(data.layers);
+        else lastLayers = data.layers;
+        lastRunData = data;
+        lastAnalysis = null;          // the analysis belongs to the previous run
+        updateSummary(data);
+        updateAnalyzeButton();
+        updateExportButtons();
+        // Recorded after rendering so a slow write never delays the results.
+        recordRun(data);
+      }
+    });
   } catch (e) {
-    grid.innerHTML = `<div class="empty"><p>Diagnostics failed: ${escapeHtml(String(e))}</p></div>`;
+    if (e && e.name === "AbortError") {
+      grid.innerHTML = `<div class="empty"><p>Run cancelled.</p>
+        <p class="muted">Press <strong>Run diagnostics</strong> to start again.</p></div>`;
+    } else {
+      grid.innerHTML = `<div class="empty"><p>Diagnostics failed: ${escapeHtml(String(e))}</p></div>`;
+    }
   } finally {
-    btn.disabled = false; btn.textContent = "Run diagnostics";
+    runAbort = null;
+    setRunning(false);
   }
 }
 
@@ -143,11 +234,40 @@ function escapeHtml(s) {
 // ---------- Local LLM (Ollama) ----------
 
 let lastRunData = null;
+// Markdown of the most recent analysis, so exports can include it.
+let lastAnalysis = null;
+
+function updateExportButtons() {
+  const ready = !!lastRunData;
+  $("export-md").disabled = !ready;
+  $("export-json").disabled = !ready;
+}
 
 function setLLMStatus(msg, cls) {
   const el = $("llmstatus");
   el.textContent = msg;
   el.className = "llmstatus" + (cls ? " " + cls : "");
+}
+
+// Default endpoint per provider, so switching providers doesn't leave the
+// previous one's port behind.
+const PROVIDER_HOSTS = { ollama: "127.0.0.1:11434", openai: "127.0.0.1:1234" };
+
+function onProviderChange() {
+  const p = $("provider").value;
+  const host = $("llmhost");
+  const known = Object.values(PROVIDER_HOSTS);
+  // Only overwrite a host the user hasn't customised.
+  if (!host.value.trim() || known.includes(host.value.trim())) {
+    host.value = PROVIDER_HOSTS[p] || "";
+  }
+  host.placeholder = PROVIDER_HOSTS[p] || "";
+  // The model list belongs to the previous provider; make the user re-detect.
+  const sel = $("model");
+  sel.innerHTML = "<option>— no models detected —</option>";
+  sel.disabled = true;
+  setLLMStatus("");
+  updateAnalyzeButton();
 }
 
 async function detectModels() {
@@ -158,7 +278,7 @@ async function detectModels() {
     const r = await fetch("/api/llm/models", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ host: $("llmhost").value.trim() }),
+      body: JSON.stringify({ host: $("llmhost").value.trim(), provider: $("provider").value }),
     });
     const data = await r.json();
     const sel = $("model");
@@ -172,7 +292,9 @@ async function detectModels() {
     if (!data.models.length) {
       sel.innerHTML = "<option>— no models installed —</option>";
       sel.disabled = true;
-      setLLMStatus("Connected, but no models found. Try `ollama pull llama3`.", "err");
+      setLLMStatus($("provider").value === "openai"
+        ? "Connected, but the server reports no loaded models."
+        : "Connected, but no models found. Try `ollama pull llama3`.", "err");
     } else {
       sel.innerHTML = data.models
         .map((m) => {
@@ -214,19 +336,50 @@ async function analyze() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         host: $("llmhost").value.trim(),
+        provider: $("provider").value,
         model: $("model").value,
         config: lastRunData.config,
         layers: lastRunData.layers,
       }),
     });
-    const data = await r.json();
-    if (!data.ok) {
-      $("aipanel-body").innerHTML = `<p class="llmstatus err">Analysis failed: ${escapeHtml(data.error || "unknown error")}</p>`;
+
+    // Failures before generation starts come back as plain JSON; once the model
+    // is producing tokens the response is an event stream instead.
+    const ctype = r.headers.get("Content-Type") || "";
+    if (!r.ok || ctype.includes("application/json")) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = (await r.json()).error || msg; } catch { /* keep status */ }
+      $("aipanel-body").innerHTML = `<p class="llmstatus err">Analysis failed: ${escapeHtml(msg)}</p>`;
       return;
     }
-    $("aipanel-meta").textContent = `${data.model}${data.durationMs ? " · " + (data.durationMs / 1000).toFixed(1) + "s" : ""}`;
-    renderAnalysisStats(data);
-    $("aipanel-body").innerHTML = renderMarkdown(data.analysis);
+
+    let text = "";
+    let pending = false;
+    const body = $("aipanel-body");
+    // Re-rendering markdown on every token is wasteful; coalesce to one paint
+    // per animation frame.
+    const paint = () => {
+      pending = false;
+      body.innerHTML = renderMarkdown(text) + `<span class="caret"></span>`;
+    };
+
+    await consumeSSE(r.body, (event, data) => {
+      if (event === "start") {
+        text = "";
+        body.innerHTML = `<span class="caret"></span>`;
+      } else if (event === "token") {
+        text += data.t || "";
+        if (!pending) { pending = true; requestAnimationFrame(paint); }
+      } else if (event === "error") {
+        body.innerHTML = `<p class="llmstatus err">Analysis failed: ${escapeHtml(data.error || "unknown error")}</p>`;
+      } else if (event === "done") {
+        $("aipanel-meta").textContent =
+          `${data.model}${data.durationMs ? " · " + (data.durationMs / 1000).toFixed(1) + "s" : ""}`;
+        renderAnalysisStats(data);
+        lastAnalysis = data.analysis || text;
+        body.innerHTML = renderMarkdown(lastAnalysis);
+      }
+    });
   } catch (e) {
     $("aipanel-body").innerHTML = `<p class="llmstatus err">Request failed: ${escapeHtml(String(e))}</p>`;
   } finally {
@@ -326,7 +479,14 @@ function renderMarkdown(md) {
 $("detect").addEventListener("click", detectModels);
 $("analyze").addEventListener("click", analyze);
 $("model").addEventListener("change", updateAnalyzeButton);
+$("provider").addEventListener("change", onProviderChange);
 $("aipanel-close").addEventListener("click", () => ($("aipanel").hidden = true));
+
+$("export-md").addEventListener("click", exportMarkdown);
+$("export-json").addEventListener("click", exportJSON);
+$("history").addEventListener("change", onHistoryPick);
+$("diffpanel-close").addEventListener("click", () => ($("diffpanel").hidden = true));
 
 $("run").addEventListener("click", run);
 loadInfo();
+refreshHistoryPicker();
