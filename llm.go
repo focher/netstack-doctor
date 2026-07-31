@@ -1,11 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -18,48 +19,28 @@ const (
 	maxChatBody = 8 << 20 // /api/chat
 )
 
-// normalizeOllama turns user input like "192.168.1.10", "192.168.1.10:11434",
-// "http://host:11434", or a bare IPv6 literal like "::1" into a clean base URL.
-func normalizeOllama(host string) string {
-	host = strings.TrimSpace(host)
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	scheme := "http://"
-	if strings.HasPrefix(host, "https://") {
-		scheme = "https://"
-	}
-	host = strings.TrimPrefix(strings.TrimPrefix(host, "http://"), "https://")
-	// Base URL only: drop any path/query and trailing slashes.
-	if i := strings.IndexAny(host, "/?#"); i >= 0 {
-		host = host[:i]
-	}
-	// Bare IPv6 literal (two-plus colons, unbracketed): bracket it so a port
-	// can be attached and the URL parses.
-	if strings.Count(host, ":") >= 2 && !strings.HasPrefix(host, "[") {
-		host = "[" + host + "]"
-	}
-	// Append the default Ollama port if none is present.
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		host = net.JoinHostPort(strings.Trim(host, "[]"), "11434")
-	}
-	return scheme + host
-}
-
-// handleLLMModels proxies Ollama's GET /api/tags so the browser avoids CORS.
+// handleLLMModels proxies the provider's model listing so the browser avoids CORS.
 func handleLLMModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
-		Host string `json:"host"`
+		Host     string `json:"host"`
+		Provider string `json:"provider"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	base := normalizeOllama(req.Host)
+	provider := normalizeProvider(req.Provider)
+	base := normalizeEndpoint(req.Host, provider)
+	label := providerLabel(provider)
 
 	client := &http.Client{Timeout: 6 * time.Second}
-	resp, err := client.Get(base + "/api/tags")
+	httpReq, err := http.NewRequestWithContext(r.Context(), "GET", modelsURL(base, provider), nil)
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error(), "endpoint": base})
+		return
+	}
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error(), "endpoint": base})
 		return
@@ -67,37 +48,24 @@ func handleLLMModels(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxTagsBody))
 	if resp.StatusCode != 200 {
-		writeJSON(w, map[string]any{"ok": false, "error": fmt.Sprintf("Ollama returned %s", resp.Status), "endpoint": base})
+		writeJSON(w, map[string]any{"ok": false, "error": fmt.Sprintf("%s returned %s", label, resp.Status), "endpoint": base})
 		return
 	}
 
-	var tags struct {
-		Models []struct {
-			Name    string `json:"name"`
-			Model   string `json:"model"`
-			Size    int64  `json:"size"`
-			Details struct {
-				ParameterSize string `json:"parameter_size"`
-			} `json:"details"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(body, &tags); err != nil {
-		writeJSON(w, map[string]any{"ok": false, "error": "unexpected response: " + err.Error(), "endpoint": base})
+	models, err := parseModelList(body, provider)
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error(), "endpoint": base})
 		return
 	}
-	models := make([]map[string]any, 0, len(tags.Models))
-	for _, m := range tags.Models {
-		name := m.Name
-		if name == "" {
-			name = m.Model
-		}
-		models = append(models, map[string]any{
-			"name":   name,
-			"params": m.Details.ParameterSize,
-			"sizeGB": float64(m.Size) / 1e9,
-		})
+	writeJSON(w, map[string]any{"ok": true, "endpoint": base, "provider": provider, "models": models})
+}
+
+// providerLabel is the human-facing name used in error messages.
+func providerLabel(provider string) string {
+	if normalizeProvider(provider) == ProviderOpenAI {
+		return "The OpenAI-compatible server"
 	}
-	writeJSON(w, map[string]any{"ok": true, "endpoint": base, "models": models})
+	return "Ollama"
 }
 
 // handleLLMAnalyze builds a diagnostic prompt and asks the local model to interpret it.
@@ -107,10 +75,11 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Host   string          `json:"host"`
-		Model  string          `json:"model"`
-		Layers json.RawMessage `json:"layers"`
-		Config json.RawMessage `json:"config"`
+		Host     string          `json:"host"`
+		Provider string          `json:"provider"`
+		Model    string          `json:"model"`
+		Layers   json.RawMessage `json:"layers"`
+		Config   json.RawMessage `json:"config"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
@@ -120,7 +89,8 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": false, "error": "no model selected"})
 		return
 	}
-	base := normalizeOllama(req.Host)
+	provider := normalizeProvider(req.Provider)
+	base := normalizeEndpoint(req.Host, provider)
 
 	prompt := buildAnalysisPrompt(req.Config, req.Layers)
 	fullInput := llmSystemPrompt + prompt
@@ -139,81 +109,117 @@ func handleLLMAnalyze(w http.ResponseWriter, r *http.Request) {
 	// block after generation completes, so don't pay for the /api/show
 	// round-trip up front.
 	infoCh := make(chan *modelDetails, 1)
-	go func() { infoCh <- fetchModelInfo(base, req.Model) }()
+	go func() { infoCh <- fetchModelInfo(r.Context(), base, provider, req.Model) }()
 
-	payload := map[string]any{
-		"model":  req.Model,
-		"stream": false,
-		"messages": []map[string]string{
-			{"role": "system", "content": llmSystemPrompt},
-			{"role": "user", "content": prompt},
-		},
-		"options": map[string]any{
-			"temperature": 0.2,
-			"num_ctx":     numCtx,
-		},
+	buf := chatPayload(provider, req.Model, llmSystemPrompt, prompt, numCtx, true)
+
+	client := &http.Client{Timeout: 10 * time.Minute}
+	httpReq, err := http.NewRequestWithContext(r.Context(), "POST", chatURL(base, provider), bytes.NewReader(buf))
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error(), "endpoint": base})
+		return
 	}
-	buf, _ := json.Marshal(payload)
-
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Post(base+"/api/chat", "application/json", bytes.NewReader(buf))
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error(), "endpoint": base})
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxChatBody))
 	if resp.StatusCode != 200 {
-		writeJSON(w, map[string]any{"ok": false, "error": fmt.Sprintf("Ollama returned %s: %s", resp.Status, string(body))})
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		writeJSON(w, map[string]any{"ok": false,
+			"error": fmt.Sprintf("%s returned %s: %s", providerLabel(provider), resp.Status, string(body))})
 		return
 	}
 
-	var out struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-		DoneReason         string `json:"done_reason"`
-		TotalDuration      int64  `json:"total_duration"`
-		LoadDuration       int64  `json:"load_duration"`
-		PromptEvalCount    int    `json:"prompt_eval_count"`
-		PromptEvalDuration int64  `json:"prompt_eval_duration"`
-		EvalCount          int    `json:"eval_count"`
-		EvalDuration       int64  `json:"eval_duration"`
+	// Past this point the response is a stream, so switch to SSE. Errors from
+	// here on are delivered as an "error" event rather than a JSON body.
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, map[string]any{"ok": false, "error": "streaming unsupported"})
+		return
 	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		writeJSON(w, map[string]any{"ok": false, "error": "could not parse model response: " + err.Error()})
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	send := func(event string, payload any) {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		flusher.Flush()
+	}
+	send("start", map[string]any{
+		"endpoint": base, "provider": provider, "model": req.Model,
+		"numCtx": numCtx, "request": reqInfo,
+	})
+
+	start := time.Now()
+	var full strings.Builder
+	var final streamChunk
+
+	// Providers stream newline-delimited chunks; a single log line can be long,
+	// so give the scanner room well beyond bufio's 64KB default.
+	sc := bufio.NewScanner(io.LimitReader(resp.Body, maxChatBody))
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		chunk, ok := parseStreamLine(sc.Text(), provider)
+		if !ok {
+			continue
+		}
+		if chunk.Content != "" {
+			full.WriteString(chunk.Content)
+			send("token", map[string]any{"t": chunk.Content})
+		}
+		if chunk.Done {
+			final = chunk
+		}
+	}
+	if err := sc.Err(); err != nil {
+		send("error", map[string]any{"error": "stream interrupted: " + err.Error()})
 		return
 	}
 
 	modelInfo := <-infoCh
 
-	// Generation metrics straight from Ollama. prompt_eval_count is the exact
-	// number of input tokens the model actually ingested — the proof the whole
-	// log made it in (compare against the model's max context).
+	// Generation metrics. prompt_eval_count is the exact number of input tokens
+	// the model actually ingested — the proof the whole log made it in (compare
+	// against the model's max context). OpenAI-compatible servers do not report
+	// these, so the block is simply thinner there.
 	genTokPerSec := 0.0
-	if out.EvalDuration > 0 {
-		genTokPerSec = float64(out.EvalCount) / (float64(out.EvalDuration) / 1e9)
+	if final.EvalDuration > 0 {
+		genTokPerSec = float64(final.EvalCount) / (float64(final.EvalDuration) / 1e9)
+	}
+	totalMs := final.TotalDuration / 1e6
+	if totalMs == 0 {
+		totalMs = time.Since(start).Milliseconds()
 	}
 	metrics := map[string]any{
-		"promptTokens":    out.PromptEvalCount,
-		"responseTokens":  out.EvalCount,
-		"totalMs":         out.TotalDuration / 1e6,
-		"loadMs":          out.LoadDuration / 1e6,
-		"promptEvalMs":    out.PromptEvalDuration / 1e6,
-		"evalMs":          out.EvalDuration / 1e6,
+		"promptTokens":    final.PromptEvalCount,
+		"responseTokens":  final.EvalCount,
+		"totalMs":         totalMs,
+		"loadMs":          final.LoadDuration / 1e6,
+		"promptEvalMs":    final.PromptEvalDuration / 1e6,
+		"evalMs":          final.EvalDuration / 1e6,
 		"genTokensPerSec": round1(genTokPerSec),
-		"doneReason":      out.DoneReason,
+		"doneReason":      final.DoneReason,
 	}
-	if modelInfo != nil && modelInfo.MaxContext > 0 && out.PromptEvalCount > 0 {
-		metrics["contextUsedPct"] = round1(float64(out.PromptEvalCount) / float64(modelInfo.MaxContext) * 100)
+	if modelInfo != nil && modelInfo.MaxContext > 0 && final.PromptEvalCount > 0 {
+		metrics["contextUsedPct"] = round1(float64(final.PromptEvalCount) / float64(modelInfo.MaxContext) * 100)
 	}
 
-	writeJSON(w, map[string]any{
+	send("done", map[string]any{
 		"ok":         true,
 		"endpoint":   base,
+		"provider":   provider,
 		"model":      req.Model,
-		"analysis":   strings.TrimSpace(out.Message.Content),
-		"durationMs": out.TotalDuration / 1e6,
+		"analysis":   strings.TrimSpace(full.String()),
+		"durationMs": totalMs,
 		"numCtx":     numCtx,
 		"request":    reqInfo,
 		"modelInfo":  modelInfo,
@@ -234,11 +240,20 @@ type modelDetails struct {
 	SizeGB        float64  `json:"sizeGB"`
 }
 
-// fetchModelInfo queries Ollama /api/show for model attributes. Returns nil on error.
-func fetchModelInfo(base, model string) *modelDetails {
+// fetchModelInfo queries Ollama /api/show for model attributes. Returns nil on
+// error, and for OpenAI-compatible servers, which expose no equivalent.
+func fetchModelInfo(ctx context.Context, base, provider, model string) *modelDetails {
+	if normalizeProvider(provider) == ProviderOpenAI {
+		return nil
+	}
 	reqBody, _ := json.Marshal(map[string]string{"model": model})
 	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Post(base+"/api/show", "application/json", bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", base+"/api/show", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil
 	}

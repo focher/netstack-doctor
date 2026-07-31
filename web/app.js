@@ -237,6 +237,27 @@ function setLLMStatus(msg, cls) {
   el.className = "llmstatus" + (cls ? " " + cls : "");
 }
 
+// Default endpoint per provider, so switching providers doesn't leave the
+// previous one's port behind.
+const PROVIDER_HOSTS = { ollama: "127.0.0.1:11434", openai: "127.0.0.1:1234" };
+
+function onProviderChange() {
+  const p = $("provider").value;
+  const host = $("llmhost");
+  const known = Object.values(PROVIDER_HOSTS);
+  // Only overwrite a host the user hasn't customised.
+  if (!host.value.trim() || known.includes(host.value.trim())) {
+    host.value = PROVIDER_HOSTS[p] || "";
+  }
+  host.placeholder = PROVIDER_HOSTS[p] || "";
+  // The model list belongs to the previous provider; make the user re-detect.
+  const sel = $("model");
+  sel.innerHTML = "<option>— no models detected —</option>";
+  sel.disabled = true;
+  setLLMStatus("");
+  updateAnalyzeButton();
+}
+
 async function detectModels() {
   const btn = $("detect");
   btn.disabled = true;
@@ -245,7 +266,7 @@ async function detectModels() {
     const r = await fetch("/api/llm/models", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ host: $("llmhost").value.trim() }),
+      body: JSON.stringify({ host: $("llmhost").value.trim(), provider: $("provider").value }),
     });
     const data = await r.json();
     const sel = $("model");
@@ -259,7 +280,9 @@ async function detectModels() {
     if (!data.models.length) {
       sel.innerHTML = "<option>— no models installed —</option>";
       sel.disabled = true;
-      setLLMStatus("Connected, but no models found. Try `ollama pull llama3`.", "err");
+      setLLMStatus($("provider").value === "openai"
+        ? "Connected, but the server reports no loaded models."
+        : "Connected, but no models found. Try `ollama pull llama3`.", "err");
     } else {
       sel.innerHTML = data.models
         .map((m) => {
@@ -301,19 +324,49 @@ async function analyze() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         host: $("llmhost").value.trim(),
+        provider: $("provider").value,
         model: $("model").value,
         config: lastRunData.config,
         layers: lastRunData.layers,
       }),
     });
-    const data = await r.json();
-    if (!data.ok) {
-      $("aipanel-body").innerHTML = `<p class="llmstatus err">Analysis failed: ${escapeHtml(data.error || "unknown error")}</p>`;
+
+    // Failures before generation starts come back as plain JSON; once the model
+    // is producing tokens the response is an event stream instead.
+    const ctype = r.headers.get("Content-Type") || "";
+    if (!r.ok || ctype.includes("application/json")) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = (await r.json()).error || msg; } catch { /* keep status */ }
+      $("aipanel-body").innerHTML = `<p class="llmstatus err">Analysis failed: ${escapeHtml(msg)}</p>`;
       return;
     }
-    $("aipanel-meta").textContent = `${data.model}${data.durationMs ? " · " + (data.durationMs / 1000).toFixed(1) + "s" : ""}`;
-    renderAnalysisStats(data);
-    $("aipanel-body").innerHTML = renderMarkdown(data.analysis);
+
+    let text = "";
+    let pending = false;
+    const body = $("aipanel-body");
+    // Re-rendering markdown on every token is wasteful; coalesce to one paint
+    // per animation frame.
+    const paint = () => {
+      pending = false;
+      body.innerHTML = renderMarkdown(text) + `<span class="caret"></span>`;
+    };
+
+    await consumeSSE(r.body, (event, data) => {
+      if (event === "start") {
+        text = "";
+        body.innerHTML = `<span class="caret"></span>`;
+      } else if (event === "token") {
+        text += data.t || "";
+        if (!pending) { pending = true; requestAnimationFrame(paint); }
+      } else if (event === "error") {
+        body.innerHTML = `<p class="llmstatus err">Analysis failed: ${escapeHtml(data.error || "unknown error")}</p>`;
+      } else if (event === "done") {
+        $("aipanel-meta").textContent =
+          `${data.model}${data.durationMs ? " · " + (data.durationMs / 1000).toFixed(1) + "s" : ""}`;
+        renderAnalysisStats(data);
+        body.innerHTML = renderMarkdown(data.analysis || text);
+      }
+    });
   } catch (e) {
     $("aipanel-body").innerHTML = `<p class="llmstatus err">Request failed: ${escapeHtml(String(e))}</p>`;
   } finally {
@@ -413,6 +466,7 @@ function renderMarkdown(md) {
 $("detect").addEventListener("click", detectModels);
 $("analyze").addEventListener("click", analyze);
 $("model").addEventListener("change", updateAnalyzeButton);
+$("provider").addEventListener("change", onProviderChange);
 $("aipanel-close").addEventListener("click", () => ($("aipanel").hidden = true));
 
 $("run").addEventListener("click", run);
