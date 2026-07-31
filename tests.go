@@ -364,17 +364,39 @@ func layer3Network(ctx context.Context, cfg RunConfig) LayerResult {
 		}
 	}
 
-	// Traceroute path
-	tests = append(tests, timed(ctx, "Path / traceroute to "+cfg.Target, func(l *logger) (string, string) {
-		l.step("tracing network path to %s (max 20 hops)", cfg.Target)
-		raw, hops, cmd := traceroute(ctx, cfg.Target, false, 20)
-		l.add("exec: %s", cmd)
-		l.block("raw traceroute output", raw)
-		l.step("counted %d responding hop(s)", hops)
-		if hops == 0 {
-			return Yellow, "No traceroute hops returned"
+	// Traceroute path, per requested family.
+	addTrace := func(label string, v6 bool) {
+		tests = append(tests, timed(ctx, label, func(l *logger) (string, string) {
+			fam := "IPv4"
+			if v6 {
+				fam = "IPv6"
+			}
+			l.step("tracing %s network path to %s (max 20 hops)", fam, cfg.Target)
+			raw, hops, cmd := traceroute(ctx, cfg.Target, v6, 20)
+			l.add("exec: %s", cmd)
+			l.block("raw traceroute output", raw)
+			l.step("counted %d responding hop(s)", hops)
+			if hops == 0 {
+				return Yellow, "No traceroute hops returned"
+			}
+			return Green, fmt.Sprintf("%d hop(s) along the path", hops)
+		}))
+	}
+	if cfg.IPv4 {
+		addTrace("Path / traceroute to "+cfg.Target+" (IPv4)", false)
+	}
+	if cfg.IPv6 {
+		if len(v6) > 0 {
+			addTrace("Path / traceroute to "+cfg.Target+" (IPv6)", true)
+		} else {
+			tests = append(tests, skipped("Path / traceroute to "+cfg.Target+" (IPv6)",
+				"No global IPv6 address on this host"))
 		}
-		return Green, fmt.Sprintf("%d hop(s) along the path", hops)
+	}
+
+	// Public IP / NAT detection.
+	tests = append(tests, timed(ctx, "Public IP & NAT detection", func(l *logger) (string, string) {
+		return publicIPProbe(ctx, cfg, l, v4, v6)
 	}))
 
 	return LayerResult{3, "Network", "IP routing, gateway, ICMP, path", rollup(tests), tests}
@@ -722,6 +744,12 @@ func layer6Presentation(ctx context.Context, cfg RunConfig) LayerResult {
 
 func layer7Application(ctx context.Context, cfg RunConfig) LayerResult {
 	var tests []TestResult
+
+	// Captive portal — checked first, because a portal makes every probe below
+	// it look healthy while the user has no real internet access.
+	tests = append(tests, timed(ctx, "Captive portal detection", func(l *logger) (string, string) {
+		return captivePortalProbe(ctx, l)
+	}))
 
 	// DNS resolution — A records
 	tests = append(tests, timed(ctx, "DNS resolution — A (IPv4)", func(l *logger) (string, string) {
